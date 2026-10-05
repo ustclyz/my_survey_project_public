@@ -13,7 +13,7 @@
    - 天区面积 (由 footprint 多边形球面面积估算)
    - 光纤数量 (``field.n_fibers``)
    - 计分基准参数 (``flux_zero_point``、``exposure_zero_point_seconds``)
-4. 将完整报告写入项目根目录 ``static_check_report.txt`` (UTF-8);
+4. 将完整报告写入项目 ``reports/static_check_report.txt`` (UTF-8);
 5. 在控制台打印每张卡的校验状态与核心统计值.
 
 运行方式::
@@ -39,7 +39,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
 CARDS_DIR: Path = PROJECT_ROOT / "cards"
-REPORT_PATH: Path = PROJECT_ROOT / "static_check_report.txt"
+REPORTS_DIR: Path = PROJECT_ROOT / "reports"
+REPORT_PATH: Path = REPORTS_DIR / "static_check_report.txt"
 
 # 每张卡必须包含的相对文件路径
 REQUIRED_FILES: Tuple[str, ...] = (
@@ -495,6 +496,7 @@ def main() -> int:
 
     report = render_report(results)
     try:
+        REPORTS_DIR.mkdir(parents=True, exist_ok=True)
         REPORT_PATH.write_text(report, encoding="utf-8")
         print(f"\n完整报告已写入: {REPORT_PATH}")
     except OSError as exc:

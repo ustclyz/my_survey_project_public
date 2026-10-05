@@ -28,10 +28,11 @@ my_survey_project/
 │   ├── cardB/                    # 正式卡 B
 │   ├── cardC/                    # 正式卡 C
 │   └── cardD/                    # 正式卡 D
+├── reports/                      # 脚本产物 (交付报告)
+│   └── static_check_report.txt   # 静态校验报告
 ├── card_static_check.py          # 任务卡静态校验脚本
 ├── preplan.py                    # 独立预规划模块 (纯静态)
-├── static_check_report.txt       # 静态校验报告 (脚本产物)
-├── opencode_worklog.txt          # 项目操作日志
+├── opencode_worklog.txt          # 项目操作日志 (本地, 不入仓)
 ├── requirements.txt              # 依赖清单 (仅标准库)
 ├── .gitignore                    # 科研项目标准忽略规则
 └── README.md                     # 本说明文件
@@ -56,7 +57,7 @@ my_survey_project/
 - 配置 JSON 解析与关键字段完整性检查;
 - 统计核心信息: 总目标数、必观测目标数、天区面积 (球面多边形面积估算)、
   光纤数量、计分基准参数 (`flux_zero_point`、`exposure_zero_point_seconds`);
-- 输出完整报告到 `static_check_report.txt` (UTF-8);
+- 输出完整报告到 `reports/static_check_report.txt` (UTF-8);
 - 控制台打印每张卡状态与核心统计值。
 
 ```powershell
@@ -137,7 +138,9 @@ Python 版本要求与预留扩展位置。
 5. **天区面积**: 由 `footprint.csv` 顶点经等距方位投影 + 鞋带公式估算,
    适用于巡天小尺度天区, 与引擎严格值可能存在极小差异。
 6. **隐藏卡**: 项目中不存在 E/F/G/H 隐藏卡, 请勿查找或生成。
-7. **日志**: 所有操作记录写入 `opencode_worklog.txt`。
+7. **日志**: 所有操作记录写入 `opencode_worklog.txt` (该文件被 `.gitignore`
+   排除, 不随仓库提交, 仅保留在本地)。
+8. **报告产物**: 静态校验报告输出至 `reports/`, 该目录随仓库提交。
 
 ---
 

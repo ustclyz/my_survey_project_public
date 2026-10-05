@@ -83,3 +83,14 @@ GOSIM 巡天智能体项目 - 操作日志 opencode_worklog.txt
   [共享路径] https://github.com/ustclyz/my_survey_project_public.git
   [共享路径] git clone https://github.com/ustclyz/my_survey_project_public.git
 
+
+[整理] 项目轻量整理
+  时间: 2026-10-05 10:22:31
+  [OK] 新建 reports/ 目录, static_check_report.txt 从根目录移入
+  [OK] card_static_check.py 报告输出路径改为 reports/static_check_report.txt, 并自动创建目录
+  [OK] 重新运行 card_static_check.py 验证: 8/8 PASS, 报告已生成于 reports/
+  [OK] 重新运行 preplan.py 验证: alpha 正常输出
+  [OK] README.md 更新项目结构 (新增 reports/) 与注意事项
+  [OK] .gitignore 注释同步
+  [i] 脚本保持在根目录, 便于智能体主程序直接 import preplan
+

@@ -101,7 +101,7 @@ credentials.json
 *.sublime-project
 *.sublime-workspace
 
-# --- 注意: 本项目不忽略 static_check_report.txt (作为交付产物保留) ---
+# --- 注意: 本项目不忽略 reports/ 下的交付报告 (作为产物保留) ---
 
 # ===========================================================================
 # 增强补充 (GOSIM 巡天黑客松 专项)
