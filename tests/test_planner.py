@@ -402,11 +402,20 @@ def test_continuity_seed_centers_generated():
 
 
 def test_plan_observe_forms_smoother_sweep_than_baseline():
-    """端到端: 开启连续性后的相邻指向跳变, 应显著小于关闭时."""
+    """端到端: 开启连续性后的相邻指向跳变, 应显著小于关闭时.
+
+    注意: 必观测锚定 (required-anchoring) 会为了覆盖散布的必观测目标而主动跳转,
+    这会与"平滑扫天"冲突 (且属有意设计 —— 覆盖优先). 因此本测试同时禁用必观测
+    锚定与加成, 以单独隔离"连续性机制"的效果.
+    """
     import statistics
 
     def avg_jump(enable: bool):
         p, nights = _make_planner_with_card("alpha")
+        # 隔离连续性机制: 关闭必观测锚定/加成, 避免其主导指向选择
+        p.required_field_bonus = 0.0
+        p._required_unfinished = set()
+        p._required_anchor_centers = lambda altaz: []
         if not enable:
             p.continuity_band_fraction = 0.0
             p.continuity_band_abs = 0.0
@@ -450,3 +459,89 @@ def test_plan_observe_forms_smoother_sweep_than_baseline():
     baseline = avg_jump(False)
     converged = avg_jump(True)
     assert converged < baseline, f"连续性应降低平均跳变 (baseline={baseline:.1f}, converged={converged:.1f})"
+
+
+# ---------------------------------------------------------------------------
+# 关键几何正确性 + 必观测保障 (本轮新增)
+# ---------------------------------------------------------------------------
+
+
+def test_tangent_offsets_returns_north_east():
+    """tangent_offsets 必须返回 (north, east): 目标在北 -> 第一分量>0; 东 -> 第二>0.
+
+    这是历史严重缺陷的回归测试: 若返回顺序被写成 (east, north), 会导致
+    FiberGrid.classify 的方位整体交换, 命中率骤降.
+    """
+    c_alt, c_az = 45.0, 100.0
+    north, east = planner_mod.tangent_offsets(46.0, 100.0, c_alt, c_az)
+    assert north > 0.1 and abs(east) < 0.05, "目标在北: 第一分量应为 north>0"
+    north2, east2 = planner_mod.tangent_offsets(45.0, 101.0, c_alt, c_az)
+    assert east2 > 0.05 and abs(north2) < 0.05, "目标在东: 第二分量应为 east>0"
+
+
+def test_fill_pointing_places_target_in_correct_fiber():
+    """给定指向, _fill_pointing 应把目标放到 classify 判定的同一根光纤.
+
+    端到端验证"预测光纤 == 独立几何重算的真实光纤"(轴向未写反).
+    """
+    p, _ = _make_planner_with_card("alpha")
+    # 构造一个含多目标的可见集, 选一个作为视场中心
+    lst = 100.0
+    visible = [t for t in p.targets.targets if p._visible(t, lst)]
+    assert visible
+    altaz = {t.target_id: planner_mod.radec_to_altaz(t.ra_deg, t.dec_deg, lst, p.lat) for t in visible}
+    ranked = visible
+    priorities = {t.target_id: (1000.0 if t.required else 1.0) for t in visible}
+    center = altaz[ranked[0].target_id]
+    assignments, _ = p._fill_pointing(ranked, priorities, altaz, center[0], center[1])
+    assert assignments
+    grid = p._fiber_grid
+    for fiber_str, tid in assignments.items():
+        a_alt, a_az = altaz[tid]
+        off = planner_mod.tangent_offsets(a_alt, a_az, center[0], center[1])
+        north, east = off
+        true_fiber, _ = grid.classify(east, north)
+        assert str(true_fiber) == fiber_str, f"{tid}: 预测 {fiber_str} != 真实 {true_fiber} (轴向写反?)"
+
+
+def test_exposure_for_completion_scales_with_flux():
+    """完成因子曝光估算: 越暗的目标, 所需曝光越长."""
+    p, _ = _make_planner_with_card("alpha")
+    from models import Target
+    bright = Target(target_id="b", ra_deg=0, dec_deg=0, feature_flux=1.0, science_weight=1.0, required=True)
+    dim = Target(target_id="d", ra_deg=0, dec_deg=0, feature_flux=0.1, science_weight=1.0, required=True)
+    altaz_pair = (60.0, 0.0)
+    need_bright = p._exposure_for_completion(bright, altaz_pair, None)
+    need_dim = p._exposure_for_completion(dim, altaz_pair, None)
+    assert need_dim > need_bright, "暗目标应需要更长曝光"
+
+
+def test_choose_duration_extends_for_required():
+    """含必观测目标的视场: 曝光应比普通视场更长 (保障完成因子 0.5)."""
+    p, _ = _make_planner_with_card("alpha")
+    from models import Target
+    lst = 100.0
+    required = [t for t in p.targets.targets if t.required and p._visible(t, lst)]
+    assert required
+    t = required[0]
+    altaz = {t.target_id: planner_mod.radec_to_altaz(t.ra_deg, t.dec_deg, lst, p.lat)}
+    dur_req = p._choose_duration({str(0): t.target_id}, 100000.0, altaz, lst, now=None)
+    assert p.min_exposure <= dur_req <= p.max_exposure
+    assert dur_req >= 60
+
+
+def test_required_anchor_centers_only_visible_unfinished():
+    """必观测锚定: 只对可见且未完成的必观测目标生成中心."""
+    p, _ = _make_planner_with_card("alpha")
+    p._required_unfinished = set()
+    assert p._required_anchor_centers({}) == []
+    # 构造一个可见的未完成必观测目标
+    lst = 100.0
+    vis_req = [t for t in p.targets.targets if t.required and p._visible(t, lst)]
+    assert vis_req
+    t = vis_req[0]
+    p._required_unfinished = {t.target_id}
+    altaz = {t.target_id: planner_mod.radec_to_altaz(t.ra_deg, t.dec_deg, lst, p.lat)}
+    centers = p._required_anchor_centers(altaz)
+    assert len(centers) >= 1, "应对可见未完成必观测生成锚定中心"
+

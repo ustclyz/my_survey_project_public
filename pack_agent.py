@@ -24,7 +24,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 MANIFEST_NAME = "observer.project.json"
 EXCLUDED_DIRS = {"__pycache__", ".git", ".venv", "venv", "run_output", ".pytest_cache",
-                 ".idea", ".vscode", ".mypy_cache", ".ruff_cache"}
+                 ".idea", ".vscode", ".mypy_cache", ".ruff_cache",
+                 "tools", "sim_data"}   # 本地开发工具与合成数据: 不进提交包
 EXCLUDED_SUFFIXES = {".pyc", ".pyo", ".zip", ".tar", ".gz", ".7z"}
 EXCLUDED_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 ENV_TEMPLATES = {".env.example", ".env.sample", ".env.template"}

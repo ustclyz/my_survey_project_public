@@ -44,6 +44,9 @@ from protocol import log
 SIDEREAL_DEG_PER_SECOND = 360.98564736629 / 86400.0
 DEFAULT_MIN_ALTITUDE_DEG = 30.0
 ALT_MARGIN_DEG = 1.0  # 规划时目标需高于最低高度角的安全余量
+# 曝光时长估算使用的"典型 seeing"参考值 (官方隐藏真值不可知). 取偏保守 (较大) 的
+# 值, 使必观测目标的完成曝光偏长, 从而在常见/偏差天气下更稳地达到完成因子 0.5.
+SEEING_REF_FOR_SCORING = 1.1
 
 
 def _julian_date(moment: datetime) -> float:
@@ -95,6 +98,12 @@ def shift_altaz(alt_deg: float, az_deg: float, d_north: float, d_east: float) ->
 
 
 def tangent_offsets(t_alt: float, t_az: float, c_alt: float, c_az: float) -> Optional[Tuple[float, float]]:
+    """目标相对视场中心的切平面偏移, 返回 ``(north, east)`` (单位: 度).
+
+    与官方 ``skymath.tangent_offsets`` 一致 (官方同样返回 ``(north, east)``).
+    调用方注意: ``preplan.FiberGrid.classify`` 的参数顺序是 ``(east, north)``,
+    必须先解包再按该顺序传入, 否则会把光纤方位写反.
+    """
     alt, az = math.radians(t_alt), math.radians(t_az)
     calt, caz = math.radians(c_alt), math.radians(c_az)
     t = (math.cos(alt) * math.cos(az), math.cos(alt) * math.sin(az), math.sin(alt))
@@ -377,6 +386,15 @@ class Planner:
         self.continuity_band_abs = 1000.0       # 或绝对 1000 分
         self.recent_fields: List[Tuple[float, float, float]] = []  # (alt, az, seq) 近期指向
         self.recent_field_horizon = 6           # 回访去重的时间窗 (轮)
+        # 必观测保障 (漏一个 -50, 是首要得分项): 未完成必观测集合, 以及"视场覆盖到
+        # 未完成必观测目标"的硬加成. 该加成直接进入视场质量, 不参与连续性折中.
+        self._required_unfinished: set = set()
+        self.required_field_bonus = 400.0       # 每个未完成必观测目标的视场加成
+        # 必观测锚定使用的中心光纤 (靠近网格中心的若干根), 用于反推指向.
+        side = self.grid_side
+        mid_lo = (side - 1) // 2
+        mid_hi = side // 2
+        self._anchor_fibers = [r * side + c for r in (mid_lo, mid_hi) for c in (mid_lo, mid_hi)]
 
         # -- LLM 调用节流 (900s 预算保护, 任务书第 6.3 条成败项) --------------
         # decide_action(环节B) 不是每轮都调: 仅在关键点或周期性调用, 其余轮次用
@@ -393,6 +411,7 @@ class Planner:
         self.refine_anchors = 4         # 精细搜索的最密锚点数
         self._center_fiber = 5          # 快速探测使用的中心光纤 (靠中间)
         self.pace_level = 0             # 0=充裕 1=适中 2=紧张
+        self._now_utc = None            # 当前决策时刻 (供曝光估算使用)
 
     # -- 初始化 ------------------------------------------------------------
     def _load_targets(self) -> None:
@@ -436,6 +455,7 @@ class Planner:
         now = req.now_utc
         if now is None:
             return Action(type="wait", duration_seconds=900, reason="无 now_utc", decision_source="fallback")
+        self._now_utc = now
 
         self._update_result(req)
 
@@ -782,18 +802,24 @@ class Planner:
             return None
         # 本夜规划目标作为优先级加成 (LLM/静态策略的落点)
         wanted = set(tid for tid in (self.night_plan.targets if self.night_plan else []) if tid in self.targets.index)
-        priorities = self._priorities_for(visible)
+        # 重要: 复制一份再修改. _priorities_for 在全体目标时会返回**缓存引用**,
+        # 若直接就地修改会跨轮累积并污染缓存 (导致结果抖动/漂移). [已修复]
+        priorities = dict(self._priorities_for(visible))
         for tid in wanted:
             if tid in priorities:
                 priorities[tid] += 500.0  # 计划优先目标获得显著加成
         # 观测记忆: 已得分目标不重复曝光 (多次曝光不累加), 给强惩罚使其排在后面;
-        # 已尝试 (无论是否命中) 给较弱惩罚, 优先推进新目标 / 补充天区.
+        # 已尝试但**未完成**的必观测目标不惩罚 (仍需继续尝试直到完成, 漏一个 -50);
+        # 其余已尝试(无论是否命中)给较弱惩罚, 优先推进新目标 / 补充天区.
+        required_ids = {t.target_id for t in self.targets.targets if t.required}
         for tid in self.observed_ids:
             if tid in priorities:
                 priorities[tid] -= 5000.0
         for tid in self.attempted_ids:
-            if tid in priorities:
+            if tid in priorities and tid not in required_ids:
                 priorities[tid] -= 200.0
+        # 记录"未完成必观测"集合, 供视场加成与必观测锚定使用.
+        self._required_unfinished = required_ids - self.observed_ids
         ranked = sorted(visible, key=lambda t: priorities.get(t.target_id, 0.0), reverse=True)
 
         # 预计算每个目标的 alt/az (避免重复计算)
@@ -847,7 +873,11 @@ class Planner:
             assignments, total = self._fill_pointing(ranked, priorities, altaz, c_alt, c_az)
             if not assignments:
                 return
-            quality = total + 50.0 * len(assignments)
+            # 必观测完成加成: 该视场能覆盖的"未完成必观测目标"数量, 直接计入质量,
+            # 确保必观测 (漏一个 -50) 优先于普通目标的边际增益. 这是**硬优先级**,
+            # 不参与后续"质量带"的连续性折中.
+            n_req = sum(1 for tid in assignments.values() if tid in self._required_unfinished)
+            quality = total + 50.0 * len(assignments) + self.required_field_bonus * n_req
             quality -= self._repeat_pointing_penalty(c_alt, c_az)
             candidates.append((quality, c_alt, c_az, assignments))
 
@@ -859,6 +889,11 @@ class Planner:
                 d_north, d_east = self._fiber_grid.cell_center(row, col)
                 c_alt, c_az = shift_altaz(a_alt, a_az, -d_north, -d_east)
                 collect_center(c_alt, c_az)
+
+        # 必观测锚定: 对当前可见的**未完成必观测目标**, 以"使其落入某光纤"为目标
+        # 生成候选中心, 保证每个可见的未完成必观测都有机会在本轮被安排.
+        for c_alt, c_az in self._required_anchor_centers(altaz):
+            collect_center(c_alt, c_az)
 
         # 连续性种子: 在上次指向附近、以及沿扫描方向继续处布置候选中心,
         # 使"平滑扫天"的期望视场进入候选集 (否则会被锚点池过滤掉).
@@ -881,7 +916,7 @@ class Planner:
             best = max(band_pool, key=lambda c: self._continuity_bonus(c[1], c[2]))
 
         _, center_alt, center_az, assignments = best
-        duration = self._choose_duration(assignments, seconds_left, altaz, lst)
+        duration = self._choose_duration(assignments, seconds_left, altaz, lst, now)
         # 程序选择: LLM 明确指定则用之; 纯静态时按月光+大气质量模型估计档位
         # (DARK×1.20 / BRIGHT×1.12 / BACKUP×1.06; 声明错档只 ×1.00).
         if self.night_plan is not None and self.night_plan.source == "llm" and self.night_plan.program in ("DARK", "BRIGHT", "BACKUP"):
@@ -965,6 +1000,39 @@ class Planner:
                 break
         return bonus
 
+    def _required_anchor_centers(self, altaz) -> List[Tuple[float, float]]:
+        """为当前可见的**未完成必观测目标**生成候选视场中心.
+
+        对每个未完成必观测目标, 生成若干"能让它落入某根光纤"的中心 (以其为锚点,
+        用光纤中心偏移反推指向). 这样即使该目标孤立、周围密度低, 也会作为候选被
+        评估, 配合 :attr:`required_field_bonus` 提高其被选中的概率.
+        """
+        centers: List[Tuple[float, float]] = []
+        if not self._required_unfinished:
+            return centers
+        # 只用少量中心光纤 (4x4 的中间 4 根) 反推指向, 兼顾密度与成本.
+        fiber_ids = self._anchor_fibers
+        # 每轮最多锚定 max_anchor 个未完成必观测目标 (按可见性/优先级取前若干),
+        # 控制候选规模与计算预算.
+        max_anchor = 24
+        anchored = 0
+        # 只锚定"当前可见"的未完成必观测目标 (altaz 中已按可见性过滤);
+        # 按 target_id 排序保证确定性. 其余可见目标由优先级排序的普通锚点覆盖.
+        visible_unfinished = [tid for tid in sorted(self._required_unfinished)
+                              if tid in altaz and altaz[tid][0] >= self.min_alt + ALT_MARGIN_DEG]
+        # 若可见的未完成必观测很多, 均匀抽样以覆盖更多目标 (而非固定取前 24 个).
+        if len(visible_unfinished) > max_anchor:
+            stride = len(visible_unfinished) / max_anchor
+            visible_unfinished = [visible_unfinished[int(i * stride)] for i in range(max_anchor)]
+        for tid in visible_unfinished:
+            a_alt, a_az = altaz[tid]
+            for fiber_id in fiber_ids:
+                row, col = divmod(fiber_id, self.grid_side)
+                d_north, d_east = self._fiber_grid.cell_center(row, col)
+                centers.append(shift_altaz(a_alt, a_az, -d_north, -d_east))
+            anchored += 1
+        return centers
+
     def _continuity_seed_centers(self, altaz) -> List[Tuple[float, float]]:
         """生成"延续扫描"的候选视场中心 (收紧搜索范围, 提升收敛性).
 
@@ -1040,7 +1108,10 @@ class Planner:
             offsets = tangent_offsets(t_alt, t_az, center_alt, center_az)
             if offsets is None:
                 continue
-            east, north = offsets
+            # 注意: tangent_offsets 返回 (north, east); FiberGrid.classify 需要
+            # (east, north). 切勿写反 —— 写反会把 16 根光纤的方位整体交换,
+            # 导致目标落到别的光纤 (命中率骤降). [已修复的历史缺陷]
+            north, east = offsets
             fiber, margin = grid.classify(east, north)
             if fiber < 0 or fiber in used:
                 continue
@@ -1085,29 +1156,86 @@ class Planner:
             return "BRIGHT"
         return "BACKUP"
 
-    def _choose_duration(self, assignments, seconds_left: float, altaz, lst) -> int:
-        """选择曝光时长: 以计分基准曝光 * duration_scale 为基准, 裁剪到合法范围与剩余时间.
+    def _choose_duration(self, assignments, seconds_left: float, altaz, lst, now=None) -> int:
+        """选择曝光时长.
 
-        暗目标需要更长的曝光才能达到完成因子 1.0; 这里取分配目标中所需最长曝光为
-        建议值 (复用 preplan 的建议逻辑思想, 但以实际分配为准).
+        策略 (参考 Cao 2025 的曝光时间计算器思想):
+            * 对**必观测目标**, 计算"达到完成因子 threshold=0.5 所需的最短曝光",
+              并取分配目标中所需最长者, 确保必观测不至于因曝光不足而判漏;
+            * 普通目标用 preplan 的建议曝光 (以计分基准曝光为锚, 按亮度缩放);
+            * 统一按 duration_scale 缩放, 裁剪到 [min, max] 与剩余时间.
+
+        完成因子模型 (公开部分):  g = flux * T * Q / (f0*T0),
+        其中 Q ≈ (η·τ·K·L)/(seeing·X^β)/q0. 隐藏项 η·τ·K/s 未知, 这里用一个
+        偏保守但合理的公开估计 Q_hat = L/(q0·X^β·seeing_ref) (seeing_ref 取典型值),
+        以便在常见天气下把必观测推到 0.5 以上.
         """
-        suggestions = []
+        seconds = []
+        required_need = 0        # 本视场中必观测目标所需的最短"完成"曝光 (不缩放)
+        # 月球只计算一次 (供所有必观测目标的完成因子估算复用).
+        moon = None
+        has_required = any(self.targets.index.get(tid) and self.targets.index[tid].required
+                           for tid in assignments.values())
+        if now is not None and has_required:
+            try:
+                moon = _Moon(now, lst, self.lat)
+            except Exception:
+                moon = None
         for tid in assignments.values():
             t = self.targets.index.get(tid)
             if t is None:
                 continue
-            suggestions.append(
-                preplan.suggest_exposure_seconds(
-                    preplan.Target(t.target_id, t.ra_deg, t.dec_deg, t.target_class,
-                                   t.feature_flux, t.science_weight, t.required),
-                    self.tool._temp_card([t]),
-                )
+            suggested = preplan.suggest_exposure_seconds(
+                preplan.Target(t.target_id, t.ra_deg, t.dec_deg, t.target_class,
+                               t.feature_flux, t.science_weight, t.required),
+                self.tool._temp_card([t]),
             )
-        base = max(suggestions) if suggestions else 900
-        duration = int(round(base * self.duration_scale / 30.0) * 30)
+            if t.required:
+                need = self._exposure_for_completion(t, altaz.get(tid), moon)
+                # 必观测 (漏一个 -50): 取"达到完成因子 0.5 所需"的最长曝光. 注意该
+                # 时长**不参与 duration_scale 缩放**, 且至少给到 need; 若该目标亮度
+                # 很低 (need 超长), 直接用 max_exposure 以最大化一次成功的概率.
+                required_need = max(required_need, need)
+            seconds.append(suggested)
+        base = max(seconds) if seconds else 900
+        normal_duration = int(round(base * self.duration_scale / 30.0) * 30)
+        duration = normal_duration
+        if required_need > 0:
+            # 必观测目标所需时长优先且不缩放; 若 need 已超过 max_exposure 的 60%,
+            # 说明该目标较暗, 直接给满 max_exposure, 提高成功概率.
+            required_duration = required_need
+            if required_need >= 0.6 * self.max_exposure:
+                required_duration = self.max_exposure
+            duration = max(duration, required_duration)
         duration = max(self.min_exposure, min(self.max_exposure, duration))
         duration = int(max(self.min_exposure, min(duration, seconds_left)))
         return duration
+
+    def _exposure_for_completion(self, target: Target, altaz_pair, moon, threshold: float = 0.5) -> int:
+        """估算某目标达到完成因子 ``threshold`` 所需的曝光秒数 (公开模型, 无隐藏真值).
+
+        g = flux·T·Q/(f0·T0) >= threshold  =>  T >= threshold·f0·T0/(flux·Q).
+        Q 用公开几何+月光的估计, 并对 seeing 取一个典型参考值 (隐藏真值不可知),
+        使结果在常见天气下偏保守 (宁可曝光略长). ``moon`` 由调用方预先算好并复用.
+        """
+        if altaz_pair is None:
+            return self.min_exposure
+        scoring = self.init.scoring or {}
+        q0 = float(scoring.get("q0", 1.0)) or 1.0
+        f0 = float(scoring.get("flux_zero_point", 0.5)) or 0.5
+        t0 = float(scoring.get("exposure_zero_point_seconds", 900.0)) or 900.0
+        beta = float(scoring.get("airmass_exponent", 0.6))
+        lunar_model = scoring.get("lunar_model") or {}
+        seeing_ref = SEEING_REF_FOR_SCORING
+
+        alt = altaz_pair[0]
+        airmass = normalized_airmass(max(alt, 1.0))
+        lunar = _lunar_factor(moon, target.ra_deg, target.dec_deg, lunar_model) if moon is not None else 1.0
+        q_hat = lunar / (q0 * (airmass ** beta) * max(1e-6, seeing_ref))
+        flux = max(1e-6, target.feature_flux)
+        need = threshold * f0 * t0 / (flux * max(1e-6, q_hat))
+        need = max(self.min_exposure, min(self.max_exposure, need))
+        return int(round(need / 30.0) * 30)
 
     @staticmethod
     def _centroid(targets: Sequence[Target]) -> Tuple[float, float]:

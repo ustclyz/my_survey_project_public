@@ -184,11 +184,39 @@ py pack_agent.py --out ..\my-agent.zip
   搜索范围 (`Planner._continuity_bonus` / `_continuity_seed_centers`)。
   实测 (alpha, 40 轮) 相邻指向中位跳变 **44.7° → 12.5°**, 指向轨迹由瞬移变为平滑
   扫天; 代价约为 ~3% 去重目标数。
+- **必观测保障 (首要得分项, 漏一个 −50)**: 未完成必观测目标 (a) 不被"已尝试"惩罚、
+  (b) 作为**锚点视场中心**进入候选 (即使孤立也会被评估) 并获视场加成
+  (`Planner._required_anchor_centers` / `required_field_bonus`); (c) 曝光时长按
+  "达到完成因子 0.5 所需"给足且**不参与 duration_scale 缩放** (参考 Cao 2025 的
+  曝光时间计算器思想). 实测 alpha 全巡天必观测漏失 **152 → 34**。
 - **可审计**: 每次 LLM 调用的 system/user/返回都写 stderr (含时间戳与调用点).
 
 > **运行可视化**: 项目外层 `survey_run_analysis.ipynb` 在本地驱动智能体跑闭环,
 > 并绘制预测 vs 真实落点 (焦平面)、预测/真实光纤、天区覆盖、收敛性 (指向轨迹与
 > 跳变) 等图, 便于直观评估策略质量。
+
+### 本地合成天气评估 (`tools/`, 仅本地)
+
+任务卡只下发 `public/` (目标/天区/夜历/计分配置), **不下发** `truth/` (逐 slot 的
+seeing / transparency / sky_quality / instrument_efficiency、天气事件等). 为在本地
+可量化评估策略, 本项目提供两个**仅本地**工具 (不进提交包, `pack_agent.py` 已排除):
+
+- `tools/weather_gen.py`: 随机生成语义与官方一致的**合成天气真值**
+  (`sim_data/<card>/weather_slots.csv` / `events.csv` / `meta.json`);
+- `tools/local_scorer.py`: **复刻官方计分公式**的本地评分器, 用合成天气跑闭环并给出
+  真实得分 (含完成因子 Q/g、程序档位/倍数、必观测扣分、Jain 均匀度)。
+
+用法:
+
+```powershell
+py tools/weather_gen.py --card alpha --seed 20261005   # 生成合成天气
+py tools/local_scorer.py --card alpha --seed 20261005 --rounds 5000
+```
+
+> 该工具链曾定位并修复一个**严重几何缺陷** (`tangent_offsets` 返回 `(north, east)`
+> 却被当作 `(east, north)` 使用), 使必观测命中率从 26% 提升到 99%、本地合成得分
+> 从 −5622 提升到 +4721.
+
 
 ---
 

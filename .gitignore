@@ -140,6 +140,11 @@ opencode_worklog.txt
 cache/
 *.plans.json
 
+# --- 本地开发工具与合成数据 (非提交内容; 见 tools/) ---
+# 说明: tools/ 为本地评估脚本 (可随仓库保留, 便于复现); sim_data/ 是生成的合成
+# 天气真值 (体积大、可复现), 不提交. 提交包由 pack_agent.py 自动排除 tools/.
+sim_data/
+
 # --- 压缩包 (任务卡原始zip保留在外部资源目录, 不提交) ---
 *.zip
 *.tar
