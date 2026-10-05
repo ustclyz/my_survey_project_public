@@ -102,3 +102,47 @@ credentials.json
 *.sublime-workspace
 
 # --- 注意: 本项目不忽略 static_check_report.txt (作为交付产物保留) ---
+
+# ===========================================================================
+# 增强补充 (GOSIM 巡天黑客松 专项)
+# ===========================================================================
+
+# --- LLM API 密钥 / 凭据 (黑客松硬性要求: 密钥绝不入仓) ---
+api_key*
+apikey*
+api_keys.json
+.credential*
+*.secret
+.secrets/
+openai_key*
+anthropic_key*
+*_API_KEY*
+*api_key*.json
+config.ini            # 可能包含密钥的本地配置
+settings.local.json
+
+# --- 项目工作日志 (Opencode 操作记录, 不随仓库提交) ---
+opencode_worklog.txt
+*_worklog.txt
+
+# --- 科学计算 / 数据缓存产物 ---
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.mat
+*.fits
+*.fits.gz
+
+# --- LLM 推理缓存 / 中间规划输出 ---
+*.cache.json
+*_cache/
+cache/
+*.plans.json
+
+# --- 压缩包 (任务卡原始zip保留在外部资源目录, 不提交) ---
+*.zip
+*.tar
+*.gz
+*.7z
+*.rar

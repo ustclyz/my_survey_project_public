@@ -26,3 +26,47 @@ GOSIM 巡天智能体项目 - 操作日志 opencode_worklog.txt
   cards\delta: fiber=True score=True targets=True footprint=True => PASS
   cards\gamma: fiber=True score=True targets=True footprint=True => PASS
 
+
+[任务2-3] 静态脚本生成与执行
+  [OK] card_static_check.py 生成, 运行结果: 8/8 张卡片通过
+  [OK] static_check_report.txt 生成 (UTF-8, 128 行)
+  [OK] preplan.py 生成并测试 (alpha/cardA/cardB/cardD 均正常输出)
+
+[任务4] 项目规范整理
+  [OK] requirements.txt (仅标准库, 声明 Python>=3.9)
+  [OK] .gitignore (Python 科研项目标准规则)
+  [OK] README.md (结构/功能/用法/注意事项)
+
+[任务5] GitHub 仓库上传
+  [环境] git version: git version 2.55.0.windows.3
+  [OK] 本地 Git 仓库初始化: C:\Users\35789\Desktop\GOSIMCreate\my_survey_project\.git
+  [i] 全局 user.name / user.email 未配置, 已设置仓库级身份:
+      user.name  = GOSIM Survey Bot
+      user.email = gosim-bot@users.noreply.github.com
+  [OK] 已 git add -A: 59 个文件进入暂存区
+  [OK] 已提交, commit message: 'init: GOSIM巡天智能体项目 - 任务卡资源 + 静态工具'
+  [i] 提交短哈希: 224ce68
+  [i] 用户未指定远程仓库地址, 未执行 push. 上传指引见下:
+
+  ---------- 新建仓库 -> 关联远程 -> 推送 命令指引 ----------
+  方式一: GitHub Web + 命令行
+    1. 登录 https://github.com/new 新建空仓库 (不要勾选 README/.gitignore)
+    2. 复制仓库 HTTPS 地址, 例如:
+         https://github.com/<你的用户名>/<仓库名>.git
+    3. 在项目根目录执行:
+         cd C:\Users\35789\Desktop\GOSIMCreate\my_survey_project
+         git remote add origin https://github.com/<你的用户名>/<仓库名>.git
+         git branch -M main
+         git push -u origin main
+
+  方式二: 使用 GitHub CLI (gh)
+         cd C:\Users\35789\Desktop\GOSIMCreate\my_survey_project
+         gh auth login
+         gh repo create <仓库名> --public --source=. --remote=origin --push
+
+  方式三: SSH
+         git remote add origin git@github.com:<你的用户名>/<仓库名>.git
+         git branch -M main
+         git push -u origin main
+  ----------------------------------------------------------
+
