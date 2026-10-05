@@ -70,3 +70,16 @@ GOSIM 巡天智能体项目 - 操作日志 opencode_worklog.txt
          git push -u origin main
   ----------------------------------------------------------
 
+
+[追加] 远程仓库变更 (同名改为公开新仓库)
+  时间: 2026-10-05 10:14:45
+  [i] 旧仓库 https://github.com/ustclyz/my_survey_project.git (未删除, 亦未再关联)
+  [OK] 新仓库 origin = https://github.com/ustclyz/my_survey_project_public.git (Public)
+  [i] 新仓库原有 GitHub 自动生成的 Initial commit (374389f), 无实际内容
+  [OK] 强制推送本机完整历史, 覆盖远程: + 374389f...96406b0 main -> main (forced update)
+  [OK] clone 复验: 59 个文件, cards 下 8 张卡片齐全
+  [i] 网络修复: 为 Git 配置代理 http://127.0.0.1:7897 (系统代理端口, 直连 GitHub 被阻断)
+      撤销方式: git config --global --unset http.proxy; git config --global --unset https.proxy
+  [共享路径] https://github.com/ustclyz/my_survey_project_public.git
+  [共享路径] git clone https://github.com/ustclyz/my_survey_project_public.git
+
