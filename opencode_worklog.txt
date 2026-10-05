@@ -216,5 +216,15 @@ GOSIM 巡天智能体项目 - 操作日志 opencode_worklog.txt
        observer.project.json 位于 ZIP 根.
 
 [步骤7] Git 提交
-  见下方 "本轮提交" 记录; 仅 commit, **未 push**.
+  时间: 2026-10-05
+  命令: git add -A; git commit
+  [OK] commit 12b387d: feat: 完整可提交巡天智能体 - 协议适配 + preplan规划内核
+       + LLM任务规划/行动决策/计划自适应
+  [i] 17 个文件变更, +3553/-115; 新增 agent/protocol/planner/llm/models/config/
+      pack_agent/observer.project.json/schemas/tests
+  [i] 状态: main 领先 origin/main 1 个提交 (ahead 1)
+  [i] **未 push** (按任务要求, 由用户决定); 需 push 时仓库已配置代理
+      http://127.0.0.1:7897.
+
+[完成] opencode_prompt.md 已按任务要求删除 (本文件为 worklog 保留).
 
