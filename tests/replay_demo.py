@@ -239,10 +239,11 @@ def run(card_name: str, rounds: int, with_llm: bool) -> int:
         remaining = max(0.0, remaining - 0.02)  # 模拟 CPU 消耗
         wall_remaining = max(0.0, wall_remaining - 0.05)
 
+    # 摘要写 stderr, 保持 stdout 只有 decision_response JSON (协议纪律)
     protocol.log(f"replay: 完成 {seq} 轮; 动作统计={actions}; "
                  f"LLM触发={llm_seen} 静态={static_seen}")
     print(f"[replay_demo] card={card_name} rounds={seq} actions={actions} "
-          f"llm_seen={llm_seen} static_seen={static_seen}")
+          f"llm_seen={llm_seen} static_seen={static_seen}", file=sys.stderr)
     return 0
 
 

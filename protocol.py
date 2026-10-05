@@ -235,7 +235,9 @@ def send_response(decision_sequence: int, action: Action) -> None:
             envelope[key] = value
 
     # 响应体大小保护: 超过 response_max_bytes 时退化为 wait.
-    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    # 使用 ensure_ascii=True: 输出纯 ASCII JSON (Unicode 转义), 规避任何终端/管道
+    # 编码问题, 且始终是合法 JSON; 平台按 JSON 解析, 转义不影响语义.
+    encoded = json.dumps(envelope, ensure_ascii=True, separators=(",", ":"))
     if len(encoded.encode("utf-8")) > 512_000:
         log("protocol: 响应过大; 退化为 wait")
         envelope = {
@@ -246,10 +248,17 @@ def send_response(decision_sequence: int, action: Action) -> None:
             "duration_seconds": 900,
             "reason": "oversize-fallback",
         }
-        encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+        encoded = json.dumps(envelope, ensure_ascii=True, separators=(",", ":"))
 
     try:
-        print(encoded, flush=True)
+        # 显式以 UTF-8 字节写 stdout, 不依赖 locale 编码 (Windows GBK 下也安全).
+        data = (encoded + "\n").encode("utf-8")
+        try:
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
+        except (AttributeError, ValueError):
+            # stdout 被替换为非 buffer 流 (如测试捕获) 时回退到 print
+            print(encoded, flush=True)
     except Exception as exc:  # noqa: BLE001
         log(f"protocol: 写 stdout 失败 ({exc})")
     _log_response(action, envelope)
