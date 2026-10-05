@@ -94,3 +94,127 @@ GOSIM 巡天智能体项目 - 操作日志 opencode_worklog.txt
   [OK] .gitignore 注释同步
   [i] 脚本保持在根目录, 便于智能体主程序直接 import preplan
 
+
+================================================================
+[第二轮任务] 开发可提交的完整智能体 (first working version)
+时间: 2026-10-05
+依据: opencode_prompt.md (已执行, 完成后删除)
+================================================================
+
+[步骤0-1] 全盘扫描项目目录 (如实记录, 无臆测)
+  项目根: C:\Users\35789\Desktop\GOSIMCreate
+  - GOSIM巡天赛题-任务卡资源与规则文档.md  (赛题说明, 9296B)
+  - opencode_prompt.md                       (本次任务书, 16837B, 完成后删除)
+  - 资源\ (只读原始 zip, 共 10 个):
+      python.zip            (官方 Python 基础示例项目!)
+      python-pro.zip        (官方 Python 进阶示例项目!)
+      taskcard-{a,b,c,d}.zip / taskcard-{alpha,beta,gamma,delta}.zip
+  - my_survey_project\ (Git 仓库, 远程 origin=my_survey_project_public):
+      preplan.py, card_static_check.py, README.md, requirements.txt,
+      .gitignore, opencode_worklog.txt, cards\ (8 张), reports\
+
+[步骤0-2] 官方示例 / 协议定义 / pack_agent.py 查找结果 (关键)
+  >>> 未臆测: 在 资源\python.zip 与 资源\python-pro.zip 中确实找到官方完整示例!
+  来源路径 (解压到临时目录 C:\Users\35789\AppData\Local\Temp\opencode\zipscan):
+    python.zip    -> python\:  agent.py, pack_agent.py, observer.project.json,
+                    requirements.txt, agent_core\{protocol,state,scoring,geometry,
+                    clock,validation,planner,llm_client,memory}.py,
+                    docs\participant-guide.{zh,en}.md (66KB/79KB 权威协议文档)
+    python-pro.zip-> python-pro\: agent.py, planner.py, skymath.py, advisor.py,
+                    llm_client.py, pack_agent.py, observer.project.json,
+                    docs\participant-guide.{zh,en}.md (同一份文档)
+  >>> 协议定义 (以官方定义为准):
+    * 传输: JSON Lines, 一行一个 JSON 对象.
+    * 外层协议版本: "participant-agent-protocol-v4"
+    * 提交清单: 项目根 observer.project.json {"protocol":"jsonl-v4",
+      "image":"python:3.12-slim","run":["python3","-u","agent.py"]}
+    * 消息类型: initialize (无需回复) / decision_request / finish.
+    * 回复: decision_response, 必须回填同样的整数 decision_sequence.
+    * 动作字段 (来自官方 protocol.py 的 _RESPONSE_FIELDS):
+        observe: pointing{alt_deg,az_deg} + assignments{纤维:"目标ID"} +
+                 duration_seconds + program(DARK/BRIGHT/BACKUP)
+        wait:    duration_seconds 或 until_utc (二选一, until 以 Z 结尾)
+        report:  无字段
+        finish:  无字段
+      可选字段: reason, decision_source.
+    * wallclock 字段: remaining_seconds (归一化 CPU 预算),
+      remaining_real_cpu_seconds (本机真实 CPU 秒), wall_remaining_seconds
+      (30 分钟硬上限剩余), speed_factor.
+    * decision_request.payload 字段: schema_version, now_utc, survey_end_utc,
+      observe_action_index, running_total, wallclock, latest_bulletin,
+      latest_forecast, active_requests, new_messages, last_result.
+    * initialize.payload 字段: schema_version, task_card, site{latitude_deg,
+      longitude_deg,sun_altitude_limit_deg,minimum_altitude_deg},
+      survey{start_utc,end_utc,slot_seconds,nights[]},
+      instrument{n_fibers,grid_side,fiber_area_deg2,gap_deg,glass_side_deg,
+      pitch_deg,fov_side_deg,exposure{...}},
+      scoring{...}, footprint[], targets{columns[],rows[]}, limits{...}.
+  >>> 结论: 官方提供了权威协议样例与 pack_agent.py. 本实现以官方 python 示例
+      的协议层为准, 字段集中在 schemas/protocol.md 并标注来源. 不再有
+      "未发现官方协议样例" 的不确定性; 仅少数任务卡专属字段标注"以任务卡为准".
+
+[步骤0-3] Git 状态
+  git status        : On branch main; working tree clean
+  remote origin     : https://github.com/ustclyz/my_survey_project_public.git
+  branch            : main -> origin/main (up to date)
+  recent commits    : 0a400c7 refactor: 报告归入 reports/
+                      7738095 docs: 远程仓库迁移与代理配置
+                      96406b0 chore: 更新 .gitignore 与操作日志
+                      224ce68 init: ...
+  代理              : 历史日志记录需用 http://127.0.0.1:7897 (本次不 push)
+
+
+[步骤1-2] 交付文件 (新增智能体主程序)
+  新增源码:
+    agent.py               - 命令行入口 + 评测主循环 (stdin JSONL -> stdout decision_response)
+    protocol.py            - 协议适配层 (initialize/decision_request 解析, 动作构造, 字段裁剪)
+    planner.py             - 决策内核 (封装 preplan.py 为规划工具; 几何; 落成 observe 动作)
+    llm.py                 - LLM 客户端 + 环节A任务规划/环节B行动决策/环节C计划自适应
+    models.py              - Target/Action/NightPlan/DecisionState/LLMConfig
+    config.py              - 环境变量读取密钥/模型 (多服务商前缀)
+    pack_agent.py          - 打包 ZIP (<50MB, 排除 .env)
+    observer.project.json  - 平台清单 {"protocol":"jsonl-v4"}
+    schemas/protocol.md    - 协议字段集中定义 + 逐字段来源标注
+    tests/test_protocol.py, tests/test_planner.py, tests/replay_demo.py, tests/__init__.py
+  更新: requirements.txt (openai 可选 + pytest), README.md (重启/环境变量/协议/自测/打包)
+  保留未改: preplan.py, card_static_check.py, cards/, reports/, .gitignore
+
+[步骤3] 协议核对结果
+  已找到官方权威定义 (资源/python.zip, python-pro.zip + participant-guide).
+  逐字段来源表见 schemas/protocol.md. 所有协议字段均有权威来源
+  (规则原文 / 官方示例 / 任务卡), **无推断字段**. 唯一"以任务卡为准"的是
+  Hard 模式的 pointing_offset (硬模式卡专属, 普通卡不启用).
+
+[步骤4] 决策内核与 LLM 落点
+  复用 preplan.py: compute_priorities (优先级打分, 必观测强制最高) +
+  FiberGrid.classify (4x4 方格光纤映射) + suggest_exposure_seconds (曝光建议).
+  未重写规划逻辑; preplan.assign_fibers 因其结果是"多指向候选集"而非单次曝光
+  光纤图, 故仅用其优先级, 单曝光 16 光纤分配由 planner 的 anchor-search 完成
+  (复用同一 FiberGrid 模型).
+  LLM 落点 (评奖硬门槛 >=2, 本题实际 3 个):
+    A. llm.LLMPlanner.plan_night    -> 任务规划 (仅新夜调用, 带缓存)
+    B. llm.LLMPlanner.decide_action -> 行动决策 (高层 observe/wait/report/finish)
+    C. llm.LLMPlanner.diagnose_abnormal -> 计划自适应 (结果异常时, 加分项)
+  预算保护: 绝不每轮调 LLM; 调用超时 30s, 重试<=2; 规划按夜缓存;
+  按 wallclock.remaining_real_cpu_seconds 自适应锚点搜索规模 (pace 0/1/2).
+  可审计: 每次调用的 system/user/返回写 stderr.
+  静态回退: 无密钥/禁用/调用失败 -> 启发式 (标记 [static]), 无密钥也能跑通.
+
+[步骤5-6] 自测结果 (交付前全部执行)
+  [OK] py card_static_check.py                       -> 8/8 PASS, 报告已更新
+  [OK] py -m pytest tests/test_protocol.py tests/test_planner.py -q
+                                                     -> 19 passed (协议+规划+LLM假客户端+缓存)
+  [OK] py tests/replay_demo.py --card alpha --rounds 60
+       -> 动作统计 {'observe': 57, 'wait': 3}; stdout 仅 JSON, 日志走 stderr;
+          所有 observe 动作通过协议校验 (光纤不重复/曝光范围/目标公开);
+          练习卡 avg 填 15.3/16 根光纤; 无密钥时 static_seen=True.
+  [OK] 端到端 agent.py (initialize+decision_request+finish 管道) -> 返回码 0,
+       stdout 一行合法 decision_response (16 光纤 observe), decision_sequence 正确回填.
+  [OK] 各卡光纤填充 (30 轮): alpha 15.3/16, cardA 14.2/16, cardB 23.2/25,
+       cardC 8.6/9, cardD 36.6/100 (受天区密度限制).
+  [OK] py pack_agent.py --out <外部>/my-agent.zip    -> 3.57 MB < 50MB, 无 .env,
+       observer.project.json 位于 ZIP 根.
+
+[步骤7] Git 提交
+  见下方 "本轮提交" 记录; 仅 commit, **未 push**.
+

@@ -1,0 +1,11 @@
+{
+  "schema_version": "observer-project-v1",
+  "protocol": "jsonl-v4",
+  "image": "python:3.12-slim",
+  "build": ["python3", "-m", "pip", "install", "--no-cache-dir", "openai"],
+  "run": ["python3", "-u", "agent.py"],
+  "working_directory": ".",
+  "environment": {
+    "PYTHONDONTWRITEBYTECODE": "1"
+  }
+}
