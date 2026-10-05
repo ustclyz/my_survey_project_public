@@ -1,0 +1,18 @@
+{
+  "exposure": {
+    "max_duration_seconds": 3600,
+    "min_duration_seconds": 60
+  },
+  "field": {
+    "fiber_area_deg2": 0.4,
+    "gap_deg": 0.0,
+    "n_fibers": 16
+  },
+  "schema_version": "v4-fiber-map-v1",
+  "site": {
+    "latitude_deg": -24.6157,
+    "longitude_deg": -70.3976,
+    "name": "VISTA/Paranal (4MOST)",
+    "utc_offset_hours": -4.0
+  }
+}

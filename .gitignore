@@ -1,0 +1,104 @@
+# ---------------------------------------------------------------------------
+# Python 科研项目标准 .gitignore
+# GOSIM 巡天智能体项目
+# ---------------------------------------------------------------------------
+
+# --- Python 编译缓存 ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Python 虚拟环境 ---
+.venv/
+venv/
+ENV/
+env/
+.python-version
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- 单元测试 / 覆盖率 ---
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+htmlcov/
+
+# --- Jupyter Notebook ---
+.ipynb_checkpoints/
+
+# --- 类型检查 / 静态分析缓存 ---
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.ruff_cache/
+
+# --- 日志与临时文件 ---
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- 本地配置 / 环境变量 / 密钥文件 (安全) ---
+.env
+.env.*
+!.env.example
+*.local
+*.local.json
+config.local.*
+secrets.*
+*.pem
+*.key
+*.p12
+credentials.json
+*token*.json
+
+# --- 数据产物 / 中间结果 (按需保留) ---
+/data/
+/outputs/
+/results/
+*.h5
+*.hdf5
+*.parquet
+*.feather
+
+# --- IDE / 编辑器 ---
+.idea/
+.vscode/
+*.code-workspace
+*.sublime-project
+*.sublime-workspace
+
+# --- 注意: 本项目不忽略 static_check_report.txt (作为交付产物保留) ---

@@ -1,0 +1,17 @@
+# GOSIM 巡天智能体项目 - Python 依赖清单
+#
+# 本项目所有脚本 (card_static_check.py / preplan.py) 均仅使用 Python 标准库,
+# 因此没有第三方运行时依赖. 该文件保留用于声明项目所需的 Python 版本,
+# 以及为后续扩展预留依赖位置.
+#
+# 运行环境要求: Python >= 3.9
+# 使用的标准库模块: argparse, csv, json, math, sys, pathlib, dataclasses,
+#                   datetime, typing
+#
+# 如需安装 pip 自身升级 (可选):
+#   py -m pip install --upgrade pip
+#
+# 后续若引入第三方库 (例如 numpy / pandas / astropy), 请在此处逐行添加,
+# 并固定版本以保证科研结果可复现, 例如:
+#   numpy==1.26.4
+#   pandas==2.2.2

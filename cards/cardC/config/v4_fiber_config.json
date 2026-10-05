@@ -1,0 +1,18 @@
+{
+  "exposure": {
+    "max_duration_seconds": 3600,
+    "min_duration_seconds": 60
+  },
+  "field": {
+    "fiber_area_deg2": 0.7,
+    "gap_deg": 0.0,
+    "n_fibers": 9
+  },
+  "schema_version": "v4-fiber-map-v1",
+  "site": {
+    "latitude_deg": 19.8207,
+    "longitude_deg": -155.4681,
+    "name": "Mauna Kea, Hawaii (virtual)",
+    "utc_offset_hours": -10.0
+  }
+}

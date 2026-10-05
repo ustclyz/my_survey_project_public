@@ -1,0 +1,18 @@
+{
+  "exposure": {
+    "max_duration_seconds": 3600,
+    "min_duration_seconds": 60
+  },
+  "field": {
+    "fiber_area_deg2": 0.064,
+    "gap_deg": 0.0,
+    "n_fibers": 25
+  },
+  "schema_version": "v4-fiber-map-v1",
+  "site": {
+    "latitude_deg": -33.9249,
+    "longitude_deg": 18.4241,
+    "name": "Cape Town, South Africa (virtual)",
+    "utc_offset_hours": 2.0
+  }
+}

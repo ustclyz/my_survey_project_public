@@ -1,0 +1,18 @@
+{
+  "schema_version": "v4-fiber-map-v1",
+  "site": {
+    "name": "Paranal, Chile (virtual)",
+    "latitude_deg": -24.6157,
+    "longitude_deg": -70.3976,
+    "utc_offset_hours": -4.0
+  },
+  "field": {
+    "fiber_area_deg2": 0.4,
+    "gap_deg": 0.0,
+    "n_fibers": 16
+  },
+  "exposure": {
+    "min_duration_seconds": 60,
+    "max_duration_seconds": 3600
+  }
+}
