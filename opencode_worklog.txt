@@ -226,5 +226,15 @@ GOSIM 巡天智能体项目 - 操作日志 opencode_worklog.txt
   [i] **未 push** (按任务要求, 由用户决定); 需 push 时仓库已配置代理
       http://127.0.0.1:7897.
 
+[步骤8] 交付前复验发现并修复的缺陷
+  [缺陷] Windows GBK 管道下, 含中文 reason 的回复经 locale 编码损坏, stdout 出现
+         非法 JSON。原因是 print 走 locale 编码。
+  [修复] protocol.send_response 改为 ensure_ascii=True + 显式 UTF-8 字节写
+         sys.stdout.buffer, 保证 stdout 在任何编码环境下都是合法 JSON。
+         tests/replay_demo.py 的摘要改走 stderr。
+  [复验] 120 轮回放 stdout 全部为合法 JSON; pytest 19 passed; card_static_check 8/8。
+  [OK] commit bdbcbb1: fix: 协议输出强制 UTF-8/ASCII JSON。
+  当前状态: main 领先 origin/main 3 个提交 (ahead 3), **未 push**。
+
 [完成] opencode_prompt.md 已按任务要求删除 (本文件为 worklog 保留).
 
