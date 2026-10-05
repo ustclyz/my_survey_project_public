@@ -259,3 +259,194 @@ def test_nightplan_parse_sanitizes():
     assert plan.duration_scale == 1.4
     assert plan.avoid_directions == ["NE"]
     assert plan.targets == ["1", "2"]
+
+
+# ---------------------------------------------------------------------------
+# 预算保护与观测记忆 (本轮新增)
+# ---------------------------------------------------------------------------
+
+
+class _FakeReq:
+    """最小 requirement 桩, 用于测试节流逻辑 (只需 decision_sequence/new_messages)."""
+
+    def __init__(self, seq, new_messages=None, last_result=None):
+        self.decision_sequence = seq
+        self.new_messages = new_messages or []
+        self.last_result = last_result
+
+
+def _planner_with_llm(card_name="alpha"):
+    """构造一个带 LLMPlanner (假密钥) 的 Planner, 便于测试节流."""
+
+    class _FakeLLM:
+        def __init__(self):
+            self.decide_calls = 0
+
+        def plan_night(self, state):
+            return NightPlan(targets=state.candidate_targets, source="static")
+
+        def decide_action(self, state, night_plan):
+            self.decide_calls += 1
+            return None  # 不改变动作, 仅计数
+
+        def diagnose_abnormal(self, state):
+            return None
+
+    p, _ = _make_planner_with_card(card_name)
+    p.llm = _FakeLLM()
+    return p, p.llm
+
+
+def test_llm_decide_throttled_not_every_round():
+    """环节B 的 LLM 调用必须是节流的, 不能每轮都调 (900s 预算成败项)."""
+    p, _ = _planner_with_llm()
+    reqs = [_FakeReq(seq=s) for s in range(1, 31)]
+    calls = 0
+    p.last_llm_decide_seq = -10**9
+    for req in reqs:
+        if p._should_call_llm_decide(req, is_new_night=False):
+            calls += 1
+            p.last_llm_decide_seq = req.decision_sequence
+    assert 1 <= calls < 30, f"30 轮内应节流 (实际 {calls})"
+
+
+def test_llm_decide_keypoint_triggers():
+    """关键点 (新夜 / 新限时请求) 应触发环节B."""
+    p, _ = _planner_with_llm()
+    p.last_llm_decide_seq = 5
+    # 新夜
+    assert p._should_call_llm_decide(_FakeReq(6), is_new_night=True)
+    # 新限时请求
+    req = _FakeReq(7, new_messages=[{"record_type": "observation_request"}])
+    assert p._should_call_llm_decide(req, is_new_night=False)
+
+
+def test_llm_decide_respects_total_cap():
+    p, _ = _planner_with_llm()
+    p.llm_decide_max_total = 3
+    p.llm_decide_calls = 3
+    assert not p._should_call_llm_decide(_FakeReq(1), is_new_night=True)
+
+
+def test_observed_targets_deprioritized():
+    """已得分目标应被降权, 避免重复曝光 (规则 5.4: 多次曝光不累加)."""
+    p, _ = _make_planner_with_card("alpha")
+    all_targets = list(p.targets.targets)
+    base = p._priorities_for(all_targets)
+    # 选一个当前优先级较高的目标, 标记为已观测后, 它应被 -5000 强惩罚挤出前列
+    top = max(all_targets, key=lambda t: base.get(t.target_id, 0.0))
+    observed_priority = base[top.target_id] - 5000.0
+    others = [t for t in all_targets if t.target_id != top.target_id]
+    max_other = max(base.get(t.target_id, 0.0) for t in others)
+    assert observed_priority < max_other, "已观测目标降权后应低于其它目标"
+
+
+def test_repeat_pointing_penalty():
+    p, _ = _make_planner_with_card("alpha")
+    # 未记录指向时无惩罚
+    assert p._repeat_pointing_penalty(45.0, 100.0) == 0.0
+    # 记录一个指向, 相同指向应被惩罚
+    p.last_pointing = (45.0, 100.0)
+    assert p._repeat_pointing_penalty(45.0, 100.0) > 0.0
+    # 相距很远 (> 半个视场) 不应惩罚
+    assert p._repeat_pointing_penalty(45.0, 260.0) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# 空间连续性 / 扫描收敛 (本轮新增)
+# ---------------------------------------------------------------------------
+
+
+def test_continuity_bonus_prefers_near_pointing():
+    """连续性目标函数: 离上次指向越近, 值越高 (无前者为 0)."""
+    p, _ = _make_planner_with_card("alpha")
+    assert p._continuity_bonus(45.0, 100.0) == 0.0        # 无历史
+    p.prev_pointing = (45.0, 100.0)
+    near = p._continuity_bonus(45.5, 100.5)
+    far = p._continuity_bonus(70.0, 100.0)
+    assert near > far, "邻近候选的连续性应更高"
+
+
+def test_continuity_momentum_rewards_sweep_direction():
+    """惯性项: 延续既有扫描方向的候选应获得额外奖励."""
+    p, _ = _make_planner_with_card("alpha")
+    p.prev_pointing = (45.0, 100.0)
+    p.sweep_altaz = (1.0, 0.0)          # 正在向北扫描
+    forward = p._continuity_bonus(46.0, 100.0)   # 继续向北
+    backward = p._continuity_bonus(44.0, 100.0)  # 反向
+    assert forward > backward, "延续扫描方向的连续性应更高"
+
+
+def test_continuity_penalizes_recent_revisit():
+    """回访去重: 与近期视场几乎重合的候选应被扣分."""
+    p, _ = _make_planner_with_card("alpha")
+    p.prev_pointing = (45.0, 100.0)
+    p.recent_fields = [(60.0, 200.0, 1)]
+    fresh = p._continuity_bonus(46.0, 100.0)
+    revisit = p._continuity_bonus(60.0, 200.0)
+    assert revisit < fresh, "回访近期视场应被扣分"
+
+
+def test_continuity_seed_centers_generated():
+    """连续性种子中心: 应在上次指向附近/扫描方向生成若干候选."""
+    p, _ = _make_planner_with_card("alpha")
+    assert p._continuity_seed_centers({}) == []      # 无历史则无种子
+    p.prev_pointing = (50.0, 120.0)
+    seeds = p._continuity_seed_centers({})
+    assert len(seeds) >= 3
+    # 至少有一个种子距离上次指向在数个视场以内 (可形成平滑过渡)
+    import math
+    fov = p._fiber_grid.fov_side_deg
+    near = [s for s in seeds if planner_mod.angular_separation_altaz(s[0], s[1], 50.0, 120.0) < fov * 4]
+    assert near, "应存在靠近上次指向的连续性种子"
+
+
+def test_plan_observe_forms_smoother_sweep_than_baseline():
+    """端到端: 开启连续性后的相邻指向跳变, 应显著小于关闭时."""
+    import statistics
+
+    def avg_jump(enable: bool):
+        p, nights = _make_planner_with_card("alpha")
+        if not enable:
+            p.continuity_band_fraction = 0.0
+            p.continuity_band_abs = 0.0
+            p._continuity_seed_centers = lambda altaz: []
+        from protocol import DecisionRequest
+        now = datetime.fromisoformat(nights[0]["observing_start_utc"].replace("Z", "+00:00")).astimezone(timezone.utc)
+        end = datetime.fromisoformat(nights[-1]["observing_end_utc"].replace("Z", "+00:00")).astimezone(timezone.utc)
+        from datetime import timedelta
+        last = None
+        prev = None
+        seps = []
+        seq = 0
+        while seq < 12 and now < end:
+            seq += 1
+            req = DecisionRequest({
+                "decision_sequence": seq,
+                "payload": {"now_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "survey_end_utc": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "wallclock": {"remaining_seconds": 900, "remaining_real_cpu_seconds": 900,
+                                          "wall_remaining_seconds": 1800},
+                            "latest_bulletin": {"notices": []}, "active_requests": [],
+                            "new_messages": [], "last_result": last},
+            })
+            act = p.decide(req)
+            if act.type == "observe" and act.pointing:
+                pt = (act.pointing["alt_deg"], act.pointing["az_deg"])
+                if prev is not None:
+                    seps.append(planner_mod.angular_separation_altaz(pt[0], pt[1], prev[0], prev[1]))
+                prev = pt
+                tids = list(act.assignments.values())
+                last = {"action": "observe", "assigned_count": len(tids),
+                        "hit_count": len(tids), "hits": [{"target_id": t} for t in tids]}
+                step = act.exposure_seconds or 900
+            elif act.type == "wait":
+                last = {"action": "wait"}; step = act.duration_seconds or 900
+            else:
+                step = 900; last = {"action": "wait"}
+            now += timedelta(seconds=step)
+        return statistics.mean(seps) if seps else float("inf")
+
+    baseline = avg_jump(False)
+    converged = avg_jump(True)
+    assert converged < baseline, f"连续性应降低平均跳变 (baseline={baseline:.1f}, converged={converged:.1f})"

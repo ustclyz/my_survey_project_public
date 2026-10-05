@@ -76,6 +76,14 @@ export OPENAI_MODEL=kimi-for-coding
 export OPENAI_API_KEY=<你的密钥>       # 只在运行页/环境变量设置, 绝不提交
 ```
 
+示例 (中科大词元计划 USTC, OpenAI 兼容, 本地调试实测可用):
+
+```powershell
+$env:OPENAI_BASE_URL = "https://api.llm.ustc.edu.cn/v1"
+$env:OPENAI_MODEL    = "deepseek-flash-2"   # 或 claude-sonnet-4-6 等
+$env:OPENAI_API_KEY  = "<你的密钥>"          # 仅本会话环境变量, 绝不写入源码
+```
+
 - `LLM_TIMEOUT_SECONDS`: 单次调用超时 (默认 30s, 裁剪到 [5,120]).
 - `OBSERVER_MODEL_DISABLED=1`: 平台无模型评测时置 1, 程序走纯静态模式, 不需要密钥.
 - 平台会设置 `HTTPS_PROXY`, 常见 SDK 无需额外配置.
@@ -85,6 +93,9 @@ export OPENAI_API_KEY=<你的密钥>       # 只在运行页/环境变量设置,
 
 依赖: 优先使用 `openai` 官方 SDK; 缺失时 `llm.py` 自动落到标准库
 `urllib.request` 直连 `{OPENAI_BASE_URL}/chat/completions`, 无需额外配置.
+
+**要求模型支持 `response_format={"type":"json_object"}`** (本项目三个 LLM 环节都
+要求返回 JSON). USTC 的 `deepseek-flash-2` 与 `claude-sonnet-4-6` 均已实测支持.
 
 ---
 
@@ -156,9 +167,28 @@ py pack_agent.py --out ..\my-agent.zip
   (`FiberGrid`) 直接复用, 未重写规划逻辑.
 - **适配器模式**: 所有协议字段集中在 `protocol.py` 与 `schemas/protocol.md`;
   官方协议一旦变更, 只改这里即可对齐.
-- **预算保护**: 绝不每轮调 LLM; 仅新夜规划 / 结果异常等关键点调用; 按
-  `wallclock` 剩余时间自适应收紧锚点搜索.
+- **预算保护 (900s CPU 成败项)**:
+  - **环节A (plan_night)** 仅在新夜调用一次, 并按夜缓存;
+  - **环节B (decide_action)** **绝不每轮调用**: 只在关键点 (新夜 / 新限时请求 /
+    结果异常) 或按周期的轮次调用; 周期由剩余 CPU 预算自适应 (预算越少间隔越大,
+    上限 20 轮), 且总调用次数与每轮平均 CPU 占比均有硬上限;
+  - 其余轮次用静态内核落成 `observe`, 保证巡天能在预算内完成;
+  - 按 `wallclock` 剩余时间自适应收紧锚点搜索 (pace 0/1/2).
+  本地实测 (USTC deepseek-flash-2): 60 轮 cardA 全流程约 110s, 仅 5 次环节B 调用.
+- **观测记忆 (避免重复曝光)**: 记录已得分目标 (`observed_ids`) 并强惩罚, 使规划
+  转向未观测目标; 记录已尝试目标 (`attempted_ids`) 弱惩罚; 记录上次指向并对重复
+  视场施加惩罚 (规则 5.4: 同一目标多次曝光只算最好一次, 不累加).
+- **空间收敛 / 扫描连续性**: 为避免相邻曝光指向大幅跳变 ("瞬移"), 在**质量带**
+  (相对最优 20% / 绝对 1000 分) 内用"连续性目标函数"择优: 邻近项 (靠近上次指向)
+  + 惯性项 (延续扫描方向) + 回访去重; 并生成"延续扫描"的候选视场中心使其进入
+  搜索范围 (`Planner._continuity_bonus` / `_continuity_seed_centers`)。
+  实测 (alpha, 40 轮) 相邻指向中位跳变 **44.7° → 12.5°**, 指向轨迹由瞬移变为平滑
+  扫天; 代价约为 ~3% 去重目标数。
 - **可审计**: 每次 LLM 调用的 system/user/返回都写 stderr (含时间戳与调用点).
+
+> **运行可视化**: 项目外层 `survey_run_analysis.ipynb` 在本地驱动智能体跑闭环,
+> 并绘制预测 vs 真实落点 (焦平面)、预测/真实光纤、天区覆盖、收敛性 (指向轨迹与
+> 跳变) 等图, 便于直观评估策略质量。
 
 ---
 

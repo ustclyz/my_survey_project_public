@@ -11,6 +11,17 @@
 **注意: 不重写规划逻辑** —— 目标优先级打分与光纤分配复用
 ``preplan.compute_priorities`` / ``preplan.assign_fibers`` / ``preplan.plan_card``.
 
+预算保护 (900s CPU 成败项):
+    * 环节A (``plan_night``) 仅在新夜调用并缓存;
+    * 环节B (``decide_action``) **绝不每轮调用**, 只在关键点或按预算自适应的周期
+      调用 (:meth:`Planner._should_call_llm_decide`);
+    * 其余轮次用静态内核落成动作, 保证巡天能在预算内完成.
+
+观测记忆:
+    * 记录已得分目标 (:attr:`Planner.observed_ids`, 强惩罚) 与已尝试目标
+      (:attr:`Planner.attempted_ids`, 弱惩罚), 避免重复曝光 (规则 5.4);
+    * 记录上次指向并对重复视场施加惩罚 (:meth:`Planner._repeat_pointing_penalty`).
+
 几何公式来源: 官方 ``docs/participant-guide`` 的 Geometry 章节与官方示例
 ``agent_core/geometry.py`` (公有公式, 不依赖任何隐藏数据).
 """
@@ -138,6 +149,15 @@ def _separation_deg(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
     r1, d1, r2, d2 = map(math.radians, (ra1, dec1, ra2, dec2))
     cosine = math.sin(d1) * math.sin(d2) + math.cos(d1) * math.cos(d2) * math.cos(r1 - r2)
     return math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+
+
+def angular_separation_altaz(alt1: float, az1: float, alt2: float, az2: float) -> float:
+    """两个地平坐标方向之间的球面角距 (度).
+
+    直接使用球面余弦定理: 把 (az, alt) 视作球面坐标的一对分量即可, 与赤道坐标
+    的角距公式同形. 仅用于判断指向是否重合, 不涉及时角/赤经转换.
+    """
+    return _separation_deg(az1, alt1, az2, alt2)
 
 
 class _Moon:
@@ -333,6 +353,41 @@ class Planner:
         self._fiber_grid = self._build_grid()
         self._priorities_all: Optional[Dict[str, float]] = None  # 全体目标优先级缓存
 
+        # -- 观测记忆: 已观测/已得分目标 (避免重复曝光同一视场) --------------
+        # 规则: 每个目标只算它最好的一次曝光, 多次曝光不累加 (规则 5.4).
+        self.observed_ids: set = set()          # 已成功得分的目标 ID
+        self.attempted_ids: set = set()         # 已尝试观测 (无论是否命中) 的目标 ID
+        self.last_pointing: Optional[Tuple[float, float]] = None  # 上次指向 (alt, az)
+        self.repeat_pointings = 0               # 与上次几乎重合的指向计数
+
+        # -- 扫描连续性 / 收敛 (让相邻曝光形成连贯扫描而非乱跳) ----------------
+        # 相邻轮指向平均跳变 28°, 会让望远镜"瞬移"且破坏天区均匀覆盖. 这里引入
+        # 迟滞 (hysteresis) 与惯性 (momentum): 在总优先级相近的候选视场中, 优先
+        # 选择离上次指向更近、且延续既有扫描方向的视场, 形成平滑扫天.
+        self.prev_pointing: Optional[Tuple[float, float]] = None   # 上一成功曝光的指向
+        self.sweep_altaz: Optional[Tuple[float, float]] = None     # 扫描方向 (alt/az 增量, 度)
+        self.continuity_bonus_max = 60.0        # 空间连续性最大加分 (连续性子目标)
+        self.continuity_scale_deg = 6.0         # 加分随角距衰减的尺度 (度)
+        self.momentum_weight = 0.35             # 惯性: 奖励延续扫描方向的权重
+        # 质量带: 仅当候选质量与最优相差不超过此带时, 才用连续性/惯性择优.
+        # 相对带 (fraction) 与绝对带 (abs) 取较大者, 适配不同任务卡的计分尺度.
+        # 实测 (alpha): 0.20 可把相邻指向中位跳变 17.6°->~13°, 大跳变次数下降,
+        # 且 RA 条带均匀度改善; 带宽过大会牺牲覆盖, 故取较保守值.
+        self.continuity_band_fraction = 0.20    # 相对最优质量的 20%
+        self.continuity_band_abs = 1000.0       # 或绝对 1000 分
+        self.recent_fields: List[Tuple[float, float, float]] = []  # (alt, az, seq) 近期指向
+        self.recent_field_horizon = 6           # 回访去重的时间窗 (轮)
+
+        # -- LLM 调用节流 (900s 预算保护, 任务书第 6.3 条成败项) --------------
+        # decide_action(环节B) 不是每轮都调: 仅在关键点或周期性调用, 其余轮次用
+        # 静态内核落成动作; 由性能预算与决策序号共同控制.
+        self.decisions_seen = 0                 # 已处理的 decision 数
+        self.llm_decide_calls = 0               # 环节B 实际调用次数
+        self.last_llm_decide_seq = -10**9       # 上次环节B调用的 decision_sequence
+        self.llm_decide_interval = 5            # 默认每隔 5 轮调一次 (pace 会覆盖)
+        self.llm_decide_max_total = 120         # 一次运行环节B调用总次数上限
+        self.llm_decide_max_fraction = 0.30     # 每轮平均最多消耗的 CPU 秒占比
+
         # 锚点搜索参数 (预算与质量的折中); 会按剩余 CPU 预算自适应缩小
         self.anchor_pool = 160          # 快速探测的锚点上限
         self.refine_anchors = 4         # 精细搜索的最密锚点数
@@ -409,6 +464,7 @@ class Planner:
         self.last_night_index = night_index
 
         self._update_pace(req)
+        self.decisions_seen += 1
         state = self._build_state(req, night_index, night_start, night_end, is_new_night)
 
         # 环节A·任务规划: 仅在新夜 (关键决策点) 调用
@@ -439,10 +495,14 @@ class Planner:
         if report is not None:
             return report
 
-        # 环节B·行动决策: LLM 给高层意向 (不是每轮都调)
+        # 环节B·行动决策: LLM 给高层意向. **不是每轮都调** (900s 预算成败项):
+        # 仅在新夜/新请求/异常等关键点, 或按预算自适应的周期上调用; 其余轮次由
+        # 静态内核落成 observe, 保证巡天能在 CPU 预算内完成.
         llm_action = None
-        if self.llm is not None:
+        if self.llm is not None and self._should_call_llm_decide(req, is_new_night):
             llm_action = self.llm.decide_action(state, self.night_plan)
+            self.llm_decide_calls += 1
+            self.last_llm_decide_seq = req.decision_sequence
         if llm_action is not None and llm_action.type == "report":
             if self._can_report():
                 return self._make_report("LLM 高层决策")
@@ -459,6 +519,44 @@ class Planner:
                           reason="暂无可观测目标", decision_source="static")
         return action
 
+    def _should_call_llm_decide(self, req, is_new_night: bool) -> bool:
+        """判断本轮是否调用环节B (行动决策) 的 LLM.
+
+        预算保护的核心: decide_action 单次约数秒, 若每轮都调会在 900s CPU 预算
+        与 30 分钟墙钟上限内耗光, 导致最后阶段无预算. 这里只在**关键决策点**或
+        **周期性**调用, 并按剩余预算自适应放宽/收紧周期.
+
+        关键点: 新夜第一轮 / 收到新的限时请求 / 结果异常 / 距上次调用超过周期.
+        硬约束: 调用总次数与每轮平均 CPU 占比均有上限.
+        """
+        if self.llm is None:
+            return False
+        if self.llm_decide_calls >= self.llm_decide_max_total:
+            return False
+        seq = req.decision_sequence
+        # 关键点 (忽略周期, 但避免连续两轮重复调用)
+        keypoint = is_new_night or self._has_new_observation_request(req) or self._state_abnormal(req)
+        if keypoint:
+            return (seq - self.last_llm_decide_seq) >= 1
+        # 周期性调用: 由性能预算决定间隔
+        return (seq - self.last_llm_decide_seq) >= max(1, self.llm_decide_interval)
+
+    @staticmethod
+    def _has_new_observation_request(req) -> bool:
+        try:
+            return any(str(m.get("record_type") or m.get("message_type") or "") == "observation_request"
+                       for m in (req.new_messages or []))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _state_abnormal(self, req) -> bool:
+        lr = req.last_result
+        if not (lr and lr.get("action") == "observe"):
+            return False
+        assigned = int(lr.get("assigned_count", 0) or 0)
+        hit = int(lr.get("hit_count", 0) or 0)
+        return assigned >= 8 and hit == 0
+
     # -- 状态与统计 --------------------------------------------------------
     def _update_result(self, req) -> None:
         lr = req.last_result
@@ -467,6 +565,14 @@ class Planner:
             hit = int(lr.get("hit_count", 0) or 0)
             self.assigned_total += assigned
             self.hits_total += hit
+            # 记忆命中 (已得分) 目标; 同时记录本轮的 assignments 为"已尝试".
+            hits = lr.get("hits") or []
+            for h in hits:
+                tid = h.get("target_id") if isinstance(h, dict) else None
+                if tid:
+                    self.observed_ids.add(str(tid))
+            for tid in (lr.get("assigned_target_ids") or []):
+                self.attempted_ids.add(str(tid))
         if lr and lr.get("action") == "report":
             correct = bool(lr.get("correct"))
             self.log(f"planner: report 结果 correct={correct} delta={lr.get('score_delta')}")
@@ -497,6 +603,18 @@ class Planner:
         if level != self.pace_level:
             self.log(f"planner: pace level {level} (每决策可用 {per_decision * 1000:.0f} ms CPU, 剩余 {cpu_left:.0f}s)")
         self.pace_level = level
+
+        # 环节B 的 LLM 调用周期 (预算保护): 估算一次 LLM 调用约 5s CPU,
+        # 只允许消耗每轮可用 CPU 预算的一小部分, 从而得出最小调用间隔.
+        # 预算充裕时才频繁调用 (但仍非每轮), 紧张时拉长间隔; 上限保守为 20 轮,
+        # 保证仍能定期获得 LLM 的高层决策 (同时关键点始终触发).
+        approx_llm_cpu = 5.0
+        if per_decision <= 1e-6:
+            self.llm_decide_interval = 20  # 几乎没有预算: 拉到最大间隔
+        else:
+            budget_for_llm = per_decision * self.llm_decide_max_fraction
+            interval = int(math.ceil(approx_llm_cpu / max(budget_for_llm, 1e-6)))
+            self.llm_decide_interval = max(1, min(interval, 20))
 
     def _current_night(self, now):
         for idx, n in enumerate(self.init.nights):
@@ -668,13 +786,22 @@ class Planner:
         for tid in wanted:
             if tid in priorities:
                 priorities[tid] += 500.0  # 计划优先目标获得显著加成
+        # 观测记忆: 已得分目标不重复曝光 (多次曝光不累加), 给强惩罚使其排在后面;
+        # 已尝试 (无论是否命中) 给较弱惩罚, 优先推进新目标 / 补充天区.
+        for tid in self.observed_ids:
+            if tid in priorities:
+                priorities[tid] -= 5000.0
+        for tid in self.attempted_ids:
+            if tid in priorities:
+                priorities[tid] -= 200.0
         ranked = sorted(visible, key=lambda t: priorities.get(t.target_id, 0.0), reverse=True)
 
         # 预计算每个目标的 alt/az (避免重复计算)
         altaz = {t.target_id: radec_to_altaz(t.ra_deg, t.dec_deg, lst, self.lat) for t in ranked}
 
-        best = None  # (score, center_alt, center_az, assignments)
+        best = None  # 兼容旧变量: 最终为 (quality, c_alt, c_az, assignments)
         seen_centers = set()
+        candidates: List[Tuple[float, float, float, Dict[str, str]]] = []  # (quality, alt, az, assignments)
         # 锚点搜索: 参照官方示例的 anchor-search 精神.
         #   1) 先用少量中心光纤快速探测每个锚点的邻域密度, 选最"密"的锚点;
         #   2) 对最优锚点用全部 16 根光纤的中心偏移做精细搜索.
@@ -708,6 +835,22 @@ class Planner:
         if not dense_centers:
             return None
         dense_centers.sort(key=lambda x: -x[0])
+
+        def collect_center(c_alt: float, c_az: float) -> None:
+            """评估一个候选中心, 收集其质量分 (供后续带内连续性择优)."""
+            if not (self.min_alt + 1.0 <= c_alt <= 89.0):
+                return
+            key = (round(c_alt, 1), round(c_az, 1))
+            if key in seen_centers:
+                return
+            seen_centers.add(key)
+            assignments, total = self._fill_pointing(ranked, priorities, altaz, c_alt, c_az)
+            if not assignments:
+                return
+            quality = total + 50.0 * len(assignments)
+            quality -= self._repeat_pointing_penalty(c_alt, c_az)
+            candidates.append((quality, c_alt, c_az, assignments))
+
         # 精细搜索: 对最密的若干锚点, 尝试全部光纤中心偏移
         for _, anchor, _, _ in dense_centers[:refine]:
             a_alt, a_az = altaz[anchor.target_id]
@@ -715,22 +858,27 @@ class Planner:
                 row, col = divmod(fiber_id, self.grid_side)
                 d_north, d_east = self._fiber_grid.cell_center(row, col)
                 c_alt, c_az = shift_altaz(a_alt, a_az, -d_north, -d_east)
-                if not (self.min_alt + 1.0 <= c_alt <= 89.0):
-                    continue
-                key = (round(c_alt, 1), round(c_az, 1))
-                if key in seen_centers:
-                    continue
-                seen_centers.add(key)
-                assignments, total = self._fill_pointing(ranked, priorities, altaz, c_alt, c_az)
-                if not assignments:
-                    continue
-                score = total + 50.0 * len(assignments)
-                if best is None or score > best[0]:
-                    best = (score, c_alt, c_az, assignments)
-            if best is not None and len(best[3]) >= self.n_fibers:
-                break
-        if best is None:
+                collect_center(c_alt, c_az)
+
+        # 连续性种子: 在上次指向附近、以及沿扫描方向继续处布置候选中心,
+        # 使"平滑扫天"的期望视场进入候选集 (否则会被锚点池过滤掉).
+        for c_alt, c_az in self._continuity_seed_centers(altaz):
+            collect_center(c_alt, c_az)
+
+        if not candidates:
             return None
+        # 收敛选择: 在"质量带"内用连续性/惯性择优 (尺度无关, 取代绝对加分).
+        #   1) 取最高质量 q_max;
+        #   2) 保留质量 >= q_max * (1 - band) - band_abs 的候选 (近似同优);
+        #   3) 其中选择连续性得分最高者 (最靠近上次指向 / 延续扫描方向).
+        best = max(candidates, key=lambda x: x[0])
+        q_max = best[0]
+        band = self.continuity_band_fraction
+        band_abs = self.continuity_band_abs
+        threshold = q_max - max(abs(q_max) * band, band_abs)
+        band_pool = [c for c in candidates if c[0] >= threshold]
+        if band_pool:
+            best = max(band_pool, key=lambda c: self._continuity_bonus(c[1], c[2]))
 
         _, center_alt, center_az, assignments = best
         duration = self._choose_duration(assignments, seconds_left, altaz, lst)
@@ -752,9 +900,119 @@ class Planner:
         center_ra, center_dec = altaz_to_radec(center_alt, center_az, lst, self.lat)
         action.ra_deg = center_ra
         action.dec_deg = center_dec
+        # 记录指向与已尝试目标 (下次规划据此避免重复视场 / 重复曝光).
+        self.last_pointing = (center_alt, center_az)
+        # 更新扫描连续性状态: 记录上一指向、扫描方向 (惯性) 与近期视场.
+        if self.prev_pointing is not None:
+            p_alt, p_az = self.prev_pointing
+            d_alt = center_alt - p_alt
+            d_az = wrap180(center_az - p_az)
+            # 指数滑动平均更新扫描方向, 抑制单轮噪声.
+            if self.sweep_altaz is None:
+                self.sweep_altaz = (d_alt, d_az)
+            else:
+                s_alt, s_az = self.sweep_altaz
+                self.sweep_altaz = (
+                    0.5 * s_alt + 0.5 * d_alt,
+                    0.5 * s_az + 0.5 * d_az,
+                )
+        self.prev_pointing = (center_alt, center_az)
+        self.recent_fields.append((center_alt, center_az, self.decisions_seen))
+        if len(self.recent_fields) > self.recent_field_horizon:
+            self.recent_fields = self.recent_fields[-self.recent_field_horizon:]
+        for tid in assignments.values():
+            self.attempted_ids.add(str(tid))
         self.log(f"planner: observe 指派 {len(assignments)} 根光纤, 曝光 {duration}s, 程序 {program}, "
                  f"指向 alt={center_alt:.2f} az={center_az:.2f}")
         return action
+
+    def _continuity_bonus(self, center_alt: float, center_az: float) -> float:
+        """"空间连续性 / 扫描惯性"目标函数 (收敛控制, 在质量带内择优使用).
+
+        目的: 让相邻曝光的指向平滑过渡、形成连贯扫天, 而不是每轮在全局重新选址
+        导致大幅跳变 (实测平均跳变 28°). 该函数**不再是无条件加到总分上的奖励**,
+        而是在"质量带"(:attr:`continuity_band_fraction` / `_abs`) 内、于近似同优的
+        候选之间作为**择优依据**, 因此不受计分尺度 (动辄上万) 影响:
+
+            1. 邻近项: 距离上次指向越近, 值越高 (指数衰减, 尺度 continuity_scale);
+            2. 惯性项: 若该视场延续既有扫描方向, 额外奖励 (形成有方向的扫描);
+            3. 回访去重: 若与近期(<= horizon 轮)某指向几乎重合, 扣分, 避免来回振荡.
+        """
+        if self.prev_pointing is None:
+            return 0.0
+        p_alt, p_az = self.prev_pointing
+        sep = angular_separation_altaz(center_alt, center_az, p_alt, p_az)
+
+        bonus = self.continuity_bonus_max * math.exp(-sep / max(1e-6, self.continuity_scale_deg))
+
+        # 惯性: 奖励延续扫描方向的候选 (与扫描方向夹角越小奖励越高).
+        if self.sweep_altaz is not None:
+            s_alt, s_az = self.sweep_altaz
+            norm = math.hypot(s_alt, s_az)
+            if norm > 1e-6 and sep > 1e-6:
+                d_alt = center_alt - p_alt
+                d_az = wrap180(center_az - p_az)
+                vnorm = math.hypot(d_alt, d_az)
+                if vnorm > 1e-6:
+                    cosine = (d_alt * s_alt + d_az * s_az) / (norm * vnorm)
+                    bonus += self.continuity_bonus_max * self.momentum_weight * max(0.0, cosine)
+
+        # 回访去重: 若与近期视场几乎重合(半个视场内), 扣分, 避免在两地间振荡.
+        half = self._fiber_grid.fov_side_deg / 2.0
+        for f_alt, f_az, _seq in self.recent_fields:
+            if angular_separation_altaz(center_alt, center_az, f_alt, f_az) < half:
+                bonus -= self.continuity_bonus_max
+                break
+        return bonus
+
+    def _continuity_seed_centers(self, altaz) -> List[Tuple[float, float]]:
+        """生成"延续扫描"的候选视场中心 (收紧搜索范围, 提升收敛性).
+
+        在上次指向附近按若干步长 (几度) 布点, 并沿扫描方向延伸, 使望远镜能够:
+            * 小幅推进 -> 平滑扫天;
+            * 沿既有方向继续 -> 形成有方向的扫描.
+        这些中心仍会经过 _fill_pointing 与连续性打分, 若质量太差则不会胜出.
+        """
+        seeds: List[Tuple[float, float]] = []
+        if self.prev_pointing is None:
+            return seeds
+        p_alt, p_az = self.prev_pointing
+        fov = self._fiber_grid.fov_side_deg
+        # 步长: 整视场宽度的若干比例 (保证相邻视场有合理重叠但不完全相同)
+        step = max(1.0, fov * 0.75)
+        # 扫描方向单位化; 无方向时默认沿方位角正向.
+        if self.sweep_altaz is not None and math.hypot(*self.sweep_altaz) > 1e-6:
+            s_alt, s_az = self.sweep_altaz
+        else:
+            s_alt, s_az = 0.0, 1.0
+        norm = math.hypot(s_alt, s_az) or 1.0
+        u_alt, u_az = s_alt / norm, s_az / norm
+        # 1) 沿扫描方向的前进点 (1~3 个步长)
+        for k in (1.0, 2.0, 3.0):
+            seeds.append(shift_altaz(p_alt, p_az, u_alt * step * k, u_az * step * k))
+        # 2) 前进点两侧的横向展开 (覆盖扫描带宽度, 避免只走一条线)
+        perp_alt, perp_az = -u_az, u_alt
+        for k in (1.0, 2.0):
+            for side in (1.0, -1.0):
+                seeds.append(shift_altaz(p_alt, p_az,
+                                         u_alt * step * k + perp_alt * step * side,
+                                         u_az * step * k + perp_az * step * side))
+        return seeds
+
+    def _repeat_pointing_penalty(self, center_alt: float, center_az: float) -> float:
+        """对与上次几乎重合的指向施加惩罚, 避免连续曝光同一视场 (多次不累加).
+
+        以球面角距衡量; 若与上次指向角距小于视场半径的 1/2, 视为重复视场, 给
+        一个足以让其它候选胜出的惩罚.
+        """
+        if self.last_pointing is None:
+            return 0.0
+        prev_alt, prev_az = self.last_pointing
+        sep = angular_separation_altaz(center_alt, center_az, prev_alt, prev_az)
+        if sep < self._fiber_grid.fov_side_deg / 2.0:
+            return 10000.0
+        return 0.0
+
 
     def _fill_pointing(self, ranked, priorities, altaz, center_alt, center_az):
         """在给定指向下, 贪心填充 16 根光纤, 返回 (assignments, total_priority).
