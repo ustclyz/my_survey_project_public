@@ -632,3 +632,31 @@ def test_achieved_g_tracking_and_retry_bonus():
     else:
         priorities[tid] += 300.0
     assert priorities["V4T000001"] > priorities["V4T000002"], "未达标目标应获重试加成而非饱和惩罚"
+
+
+def test_budget_adaptive_wait_scales_with_budget():
+    """预算越紧, 等待动作跨越的时隙越多 (避免逐 slot 空转耗尽 CPU)."""
+    p, nights = _make_planner_with_card("alpha")
+    n = nights[0]
+    start = datetime.fromisoformat(n["observing_start_utc"].replace("Z", "+00:00")).astimezone(timezone.utc)
+    end = datetime.fromisoformat(n["observing_end_utc"].replace("Z", "+00:00")).astimezone(timezone.utc)
+    now = start + (end - start) / 4
+    p.per_decision_cpu = 0.5                      # 充裕
+    loose = p._wait_action(now, start, end, "test")
+    p._empty_waits_in_night = 0
+    p.per_decision_cpu = 0.03                     # 紧张
+    tight = p._wait_action(now, start, end, "test")
+    assert (loose.duration_seconds or 0) <= (tight.duration_seconds or 0), "预算紧时应等更久"
+
+
+def test_budget_adaptive_wait_defers_night_skip_until_empty():
+    """只有本夜连续多轮无目标时才跳夜, 避免刚入夜就误跳."""
+    p, nights = _make_planner_with_card("alpha")
+    n = nights[0]
+    start = datetime.fromisoformat(n["observing_start_utc"].replace("Z", "+00:00")).astimezone(timezone.utc)
+    end = datetime.fromisoformat(n["observing_end_utc"].replace("Z", "+00:00")).astimezone(timezone.utc)
+    now = start
+    p.per_decision_cpu = 0.01
+    p._empty_waits_in_night = 0                   # 刚入夜
+    a1 = p._wait_action(now, start, end, "test")
+    assert a1.until_utc is None, "刚入夜不应跳到下一夜"

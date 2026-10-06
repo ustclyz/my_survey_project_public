@@ -429,6 +429,8 @@ class Planner:
         self.refine_anchors = 4         # 精细搜索的最密锚点数
         self._center_fiber = 5          # 快速探测使用的中心光纤 (靠中间)
         self.pace_level = 0             # 0=充裕 1=适中 2=紧张
+        self.per_decision_cpu = float("inf")  # 每决策可用的 CPU 秒 (预算保护)
+        self._empty_waits_in_night = 0  # 本夜连续"无目标"等待轮数 (用于跳夜判据)
         self._now_utc = None            # 当前决策时刻 (供曝光估算使用)
 
     # -- 初始化 ------------------------------------------------------------
@@ -476,6 +478,8 @@ class Planner:
         self._now_utc = now
 
         self._update_result(req)
+        # 预算档位提前计算: 供后续等待动作做预算自适应 (跳过空转 slot).
+        self._update_pace(req)
 
         # 白天: 等到下一夜
         night = self._current_night(now)
@@ -488,8 +492,7 @@ class Planner:
 
         # 站点因雨/暴风关闭
         if self._site_closed(req):
-            return Action(type="wait", duration_seconds=self._to_next_slot(now, night_start),
-                          reason="简报: 全天天雨/暴风", decision_source="static")
+            return self._wait_action(now, night_start, night_end, "简报: 全天天雨/暴风")
 
         # 夜晚即将结束
         if (night_end - now).total_seconds() < self.min_exposure:
@@ -500,8 +503,9 @@ class Planner:
 
         is_new_night = night_index != self.last_night_index
         self.last_night_index = night_index
+        if is_new_night:
+            self._empty_waits_in_night = 0
 
-        self._update_pace(req)
         self.decisions_seen += 1
         state = self._build_state(req, night_index, night_start, night_end, is_new_night)
 
@@ -552,14 +556,12 @@ class Planner:
                 return Action(type="finish", reason=llm_action.reason, decision_source="llm")
             self.log("planner: 忽略 LLM 的提前 finish (仍有剩余观测时间)")
         if llm_action is not None and llm_action.type == "wait":
-            return Action(type="wait", duration_seconds=self._to_next_slot(now, night_start),
-                          reason=llm_action.reason, decision_source="llm")
+            return self._wait_action(now, night_start, night_end, llm_action.reason)
 
         # 落成 observe (LLM 意向或纯静态)
         action = self._plan_observe(now, night_end, night_index, state)
         if action is None:
-            return Action(type="wait", duration_seconds=self._to_next_slot(now, night_start),
-                          reason="暂无可观测目标", decision_source="static")
+            return self._wait_action(now, night_start, night_end, "暂无可观测目标")
         return action
 
     def _should_call_llm_decide(self, req, is_new_night: bool) -> bool:
@@ -654,6 +656,7 @@ class Planner:
                     eff_start = max(start, req.now_utc) if start else req.now_utc
                     decisions_left += max(0.0, (end - eff_start).total_seconds()) / 700.0
         per_decision = cpu_left / max(1.0, decisions_left)
+        self.per_decision_cpu = per_decision
         # 阈值: 每决策可用 CPU 秒
         level = 0 if per_decision > 0.35 else 1 if per_decision > 0.10 else 2
         if level != self.pace_level:
@@ -691,6 +694,38 @@ class Planner:
     def _to_next_slot(self, now, night_start) -> int:
         into = (now - night_start).total_seconds() % self.slot_seconds
         return int(max(60, min(3600, self.slot_seconds - into if into else self.slot_seconds)))
+
+    def _wait_action(self, now, night_start, night_end, reason: str) -> Action:
+        """预算自适应的等待动作 (避免把 CPU 预算耗在空转的逐 slot wait 上).
+
+        在"当前无可见目标 / 站点关闭"等**本就不观测**的情形下等待. 当每决策可用
+        CPU 预算紧张时, 一次等待跨多个 slot (甚至整夜), 把预算省给真正能观测的时刻;
+        预算充裕时仍逐 slot 走, 不错过任何机会.
+        """
+        cpu = self.per_decision_cpu
+        self._empty_waits_in_night += 1
+        if cpu == float("inf") or cpu >= 0.20:
+            mult = 1
+        elif cpu >= 0.10:
+            mult = 2
+        elif cpu >= 0.05:
+            mult = 4
+        else:
+            mult = 8
+        # 本夜剩余 slot 数
+        secs_left = max(0.0, (night_end - now).total_seconds())
+        slots_available = max(1, int(secs_left // self.slot_seconds))
+        slots = max(1, min(slots_available, mult))
+        # 若预算很紧、本夜剩余时间还很长、且**本夜已连续多轮无目标可观测**, 才跳到
+        # 下一夜 (避免刚入夜、目标尚未升起就误跳整夜).
+        if (cpu < 0.05 and secs_left > self.slot_seconds * 12
+                and self._empty_waits_in_night >= 3):
+            nxt = self._next_night_start(now)
+            if nxt is not None:
+                return Action(type="wait", until_utc=_format_utc(nxt),
+                              reason=f"{reason} (预算紧张, 跳到下一夜)", decision_source="static")
+        duration = int(max(60, min(3600, slots * self.slot_seconds)))
+        return Action(type="wait", duration_seconds=duration, reason=reason, decision_source="static")
 
     def _survey_effectively_over(self, now, night_end) -> bool:
         """巡天是否确实已无可观测时间 (用于决定是否接受 LLM 的 finish).
@@ -1036,6 +1071,7 @@ class Planner:
                     0.5 * s_az + 0.5 * d_az,
                 )
         self.prev_pointing = (center_alt, center_az)
+        self._empty_waits_in_night = 0   # 本轮成功观测: 清空"无目标"计数
         self.recent_fields.append((center_alt, center_az, self.decisions_seen))
         if len(self.recent_fields) > self.recent_field_horizon:
             self.recent_fields = self.recent_fields[-self.recent_field_horizon:]
