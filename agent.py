@@ -29,10 +29,37 @@ if sys.version_info < (3, 9):
     sys.stderr.write("agent: 需要 Python 3.9 或更高版本\n")
     raise SystemExit(3)
 
+
+def _harden_stdout() -> None:
+    """确保 stdout **只**承载协议消息, 其余输出一律走 stderr.
+
+    做法: 保存真实 stdout 作为协议流, 再把 ``sys.stdout`` 重定向到 ``sys.stderr``.
+    这样即便我们的代码或第三方库 (openai/httpx 等) 在任意时刻意外 print, 也只会
+    落到 stderr, 不会污染平台解析的协议通道. 所有日志/异常本就走 stderr.
+
+    必须在**导入其它模块之前**尽早调用 (第三方库导入时可能打印), 故直接在本模块
+    顶层执行.
+    """
+    real_stdout = sys.stdout
+    try:
+        sys.stdout = sys.stderr
+    except Exception:  # noqa: BLE001 - 极端环境下重定向失败也不影响协议流
+        pass
+    return real_stdout
+
+
+# 尽早硬化 stdout, 并把真实 stdout 绑定为协议输出流.
+_REAL_STDOUT = _harden_stdout()
+
 from config import load_config
 from llm import LLMPlanner
 from planner import Planner, PlannerTool, load_card_for
-from protocol import InitializeData, DecisionRequest, log, parse_initialize, parse_decision_request, read_messages, send_response
+from protocol import (InitializeData, DecisionRequest, bind_protocol_stdout, log,
+                      parse_initialize, parse_decision_request, read_messages, send_response)
+
+bind_protocol_stdout(_REAL_STDOUT)
+
+
 
 
 def _card_slug_candidates(card_id: str):

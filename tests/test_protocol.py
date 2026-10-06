@@ -179,3 +179,29 @@ def test_stdout_is_pure_json(capsys):
     assert len(out_lines) == 4
     for ln in out_lines:
         json.loads(ln)  # 每行都是合法 JSON
+
+
+def test_send_response_respects_bound_protocol_stream():
+    """绑定协议流后, 即使 sys.stdout 被重定向, 协议消息也只写到绑定流 (stdout)."""
+    import io
+    import sys as _sys
+    import protocol
+    # 用本次私有文件对象模拟"真实 stdout"
+    class _Sink(io.StringIO):
+        pass
+    sink = _Sink()
+    orig_stdout = _sys.stdout
+    orig_binding = protocol._PROTOCOL_STREAM
+    try:
+        protocol.bind_protocol_stdout(sink)
+        # 把当前 sys.stdout 重定向到别处 (模拟被 stderr 接管)
+        redirect = io.StringIO()
+        _sys.stdout = redirect
+        protocol.send_response(99, Action(type="wait", duration_seconds=900))
+        _sys.stdout = orig_stdout
+        # 协议消息应落在 sink, 而不是 redirect
+        assert "decision_response" in sink.getvalue()
+        assert "decision_response" not in redirect.getvalue()
+    finally:
+        _sys.stdout = orig_stdout
+        protocol._PROTOCOL_STREAM = orig_binding
