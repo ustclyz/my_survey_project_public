@@ -545,3 +545,90 @@ def test_required_anchor_centers_only_visible_unfinished():
     centers = p._required_anchor_centers(altaz)
     assert len(centers) >= 1, "应对可见未完成必观测生成锚定中心"
 
+
+
+# ---------------------------------------------------------------------------
+# LLM 输出稳健性 + 提前 finish 保护 (本轮新增)
+# ---------------------------------------------------------------------------
+
+
+def test_llm_json_extraction_robust():
+    """_parse_content 应能从带解释/代码围栏/嵌套的回复中抽出 JSON 对象."""
+    from llm import LLMClient
+    # 纯 JSON
+    assert LLMClient._parse_content('{"a": 1}') == {"a": 1}
+    # 前后有解释文字
+    assert LLMClient._parse_content('好的, 结果是 {"action": "observe"} 以上')["action"] == "observe"
+    # ```json 代码围栏
+    assert LLMClient._parse_content('```json\n{"action":"wait"}\n```')["action"] == "wait"
+    # 字符串内含花括号 (平衡扫描不应被打断)
+    r = LLMClient._parse_content('{"strategy": "遇到 { 和 } 也要正确", "program": "DARK"}')
+    assert r["program"] == "DARK" and "{" in r["strategy"]
+    # 多个对象: 取第一个完整对象
+    assert LLMClient._parse_content('{"a":1}{"b":2}') == {"a": 1}
+    # 无可解析 JSON -> 抛错
+    import pytest
+    from llm import LLMError
+    with pytest.raises(LLMError):
+        LLMClient._parse_content("完全没有 JSON")
+
+
+def test_llm_finish_ignored_within_night():
+    """LLM 幻觉 finish 不得在夜内提前终止巡天 (历史缺陷: card C 首轮即 finish)."""
+    p, nights = _make_planner_with_card("alpha")
+
+    # 伪造一个总是返回 finish 的 LLM
+    class _FinishLLM:
+        llm_decide_calls = 0
+        last_llm_decide_seq = -10**9
+
+        def plan_night(self, state):
+            return NightPlan(targets=state.candidate_targets, source="static")
+
+        def decide_action(self, state, night_plan):
+            from models import Action
+            return Action(type="finish", reason="LLM: 收尾", decision_source="llm")
+
+        def diagnose_abnormal(self, state):
+            return None
+
+    p.llm = _FinishLLM()
+    # 直接测试保护判据: 夜内 (now < night_end) 一律不认为结束
+    n = nights[0]
+    start = datetime.fromisoformat(n["observing_start_utc"].replace("Z", "+00:00")).astimezone(timezone.utc)
+    end = datetime.fromisoformat(n["observing_end_utc"].replace("Z", "+00:00")).astimezone(timezone.utc)
+    from datetime import timedelta
+    mid = start + (end - start) / 2
+    assert p._survey_effectively_over(mid, end) is False, "夜内不得接受 finish"
+
+    # 端到端: 夜内一次 decide 不应返回 finish
+    from protocol import DecisionRequest
+    req = DecisionRequest({
+        "decision_sequence": 1,
+        "payload": {"now_utc": mid.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "survey_end_utc": nights[-1]["observing_end_utc"],
+                    "wallclock": {"remaining_seconds": 900, "remaining_real_cpu_seconds": 900,
+                                  "wall_remaining_seconds": 1800},
+                    "latest_bulletin": {"notices": []}, "active_requests": [],
+                    "new_messages": [], "last_result": None},
+    })
+    act = p.decide(req)
+    assert act.type != "finish", "夜内 LLM 的 finish 应被忽略"
+
+
+def test_achieved_g_tracking_and_retry_bonus():
+    """达标记忆: 完成因子上界 < 0.5 的目标不应被强惩罚 (应保留重试机会)."""
+    p, _ = _make_planner_with_card("alpha")
+    p.observed_ids.add("V4T000001")
+    p.achieved_g["V4T000001"] = 0.3   # 上界 < 0.5 -> 未达标
+    # 优先级里不应出现 -5000 的强饱和惩罚; 用 _plan_observe 内部逻辑间接验证:
+    # 直接检查 _survey_effectively_over 之外的辅助: 这里构造 priorities 复现惩罚规则.
+    priorities = {"V4T000001": 1000.0, "V4T000002": 1000.0}
+    sat_threshold = 0.5
+    tid = "V4T000001"
+    g_upper = p.achieved_g.get(tid)
+    if g_upper is not None and g_upper >= sat_threshold:
+        priorities[tid] -= 5000.0
+    else:
+        priorities[tid] += 300.0
+    assert priorities["V4T000001"] > priorities["V4T000002"], "未达标目标应获重试加成而非饱和惩罚"

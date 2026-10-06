@@ -406,7 +406,9 @@ class Planner:
         # **最佳时段**(中天附近 + 暗夜), 而非"可见即观测". 同时记录尝试次数与已达成
         # 的完成因子, 对"尝试过但未完成"的目标进行**重试**并加大曝光.
         self.required_attempts: Dict[str, int] = {}     # 必观测目标已尝试次数
-        self.required_best_g: Dict[str, float] = {}      # 必观测目标已达成的最好完成因子
+        # 全局"已达成完成因子上界"记忆 (所有目标): score/w = g·m 是 g 的上界; 用于
+        # 判断目标是否已达标 (g>=threshold) 或需要重试 (上界仍 < threshold).
+        self.achieved_g: Dict[str, float] = {}
         self._required_transit_alt: Dict[str, float] = {}  # 目标当日中天高度角 (缓存)
         self._required_transit_lst: Dict[str, float] = {}  # 目标中天时的 LST
         # 时序加成的权重 (叠加到必观测锚点的视场质量上, 使其在最佳时段更易胜出).
@@ -543,7 +545,12 @@ class Planner:
             if self._can_report():
                 return self._make_report("LLM 高层决策")
         if llm_action is not None and llm_action.type == "finish":
-            return Action(type="finish", reason=llm_action.reason, decision_source="llm")
+            # 关键保护: 绝不因 LLM 一句话就提前结束整个巡天. 只有"确实没有剩余观测
+            # 时间"时才接受 finish; 否则忽略之, 继续用静态内核观测/等待.
+            # (历史教训: card C 首轮 LLM 幻觉输出 {"action":"finish"} 直接终止了整场.)
+            if self._survey_effectively_over(now, night_end):
+                return Action(type="finish", reason=llm_action.reason, decision_source="llm")
+            self.log("planner: 忽略 LLM 的提前 finish (仍有剩余观测时间)")
         if llm_action is not None and llm_action.type == "wait":
             return Action(type="wait", duration_seconds=self._to_next_slot(now, night_start),
                           reason=llm_action.reason, decision_source="llm")
@@ -606,19 +613,20 @@ class Planner:
             for h in hits:
                 tid = h.get("target_id") if isinstance(h, dict) else None
                 if tid:
-                    self.observed_ids.add(str(tid))
-                    # 时序感知: 记录必观测目标已达成的最好完成因子估计.
-                    # 引擎返回的 hits[].score = c = w·g·m (m∈[1.0,1.2]); 这里以
-                    # g_est = score / (w·1.2) 作保守下界估计, 用于判断是否已达 0.5.
-                    t = self.targets.index.get(str(tid))
-                    if t is not None and t.required:
+                    tid = str(tid)
+                    self.observed_ids.add(tid)
+                    # 记录该目标已达成的"完成因子上界"估计: 引擎返回
+                    # hits[].score = c = w·g·m (m∈[1.0,1.2]), 故 score/w = g·m >= g,
+                    # 即 score/w 是 g 的上界. 若 score/w < 阈值, 则**必定** g < 阈值
+                    # (一定未达标), 需要重试; 对所有目标都跟踪 (不只必观测).
+                    t = self.targets.index.get(tid)
+                    if t is not None:
                         try:
                             score = float(h.get("score", 0.0))
                         except (TypeError, ValueError):
                             score = 0.0
-                        denom = max(1e-6, t.science_weight * 1.2)
-                        g_est = max(0.0, score / denom)
-                        self.required_best_g[str(tid)] = max(self.required_best_g.get(str(tid), 0.0), g_est)
+                        g_upper = max(0.0, score / max(1e-6, t.science_weight))
+                        self.achieved_g[tid] = max(self.achieved_g.get(tid, 0.0), g_upper)
             for tid in (lr.get("assigned_target_ids") or []):
                 self.attempted_ids.add(str(tid))
         if lr and lr.get("action") == "report":
@@ -683,6 +691,16 @@ class Planner:
     def _to_next_slot(self, now, night_start) -> int:
         into = (now - night_start).total_seconds() % self.slot_seconds
         return int(max(60, min(3600, self.slot_seconds - into if into else self.slot_seconds)))
+
+    def _survey_effectively_over(self, now, night_end) -> bool:
+        """巡天是否确实已无可观测时间 (用于决定是否接受 LLM 的 finish).
+
+        仅当当前夜已结束**且**没有未来的观测夜时才算结束. 在夜内一律不认为结束
+        (防止 LLM 幻觉提前终止整场巡天).
+        """
+        if now < night_end:
+            return False
+        return self._next_night_start(now) is None
 
     def _site_closed(self, req) -> bool:
         notices = self._all_notices(req)
@@ -836,29 +854,38 @@ class Planner:
         for tid in wanted:
             if tid in priorities:
                 priorities[tid] += 500.0  # 计划优先目标获得显著加成
-        # 观测记忆: 已得分目标不重复曝光 (多次曝光不累加), 给强惩罚使其排在后面;
-        # 已尝试但**未完成**的必观测目标不惩罚 (仍需继续尝试直到完成, 漏一个 -50);
-        # 其余已尝试(无论是否命中)给较弱惩罚, 优先推进新目标 / 补充天区.
+        # 观测记忆 (升级): 只有**已达标**的目标 (完成因子上界 >= 阈值) 才强惩罚、
+        # 不再重复曝光 (多次曝光不累加); 对"已尝试但未达标"的目标 (上界 < 阈值)
+        # 反而给**重试加成**, 让它们有机会在更好时段/更长曝光下补达标.
         required_ids = {t.target_id for t in self.targets.targets if t.required}
-        for tid in self.observed_ids:
-            if tid in priorities:
-                priorities[tid] -= 5000.0
-        for tid in self.attempted_ids:
-            if tid in priorities and tid not in required_ids:
-                priorities[tid] -= 200.0
-        # 记录"未完成必观测"集合, 供视场加成与必观测锚定使用.
-        # 判定: 必观测目标若已有估计完成因子 >= 0.5 才算完成; 否则需继续尝试
-        # (漏一个 -50). 没有分数估计时, 退化为"是否曾命中".
         req_threshold = float((self.init.scoring or {}).get("required", {}).get(
             "observed_factor_threshold", 0.5)) if isinstance(self.init.scoring, dict) else 0.5
+        # 达标阈值: 用 0.5; 上界一致性用 0.55 (留少量余量, 避免误判达标而漏补).
+        sat_threshold = req_threshold
+        for tid in list(self.observed_ids):
+            if tid not in priorities:
+                continue
+            g_upper = self.achieved_g.get(tid)
+            if g_upper is not None and g_upper >= sat_threshold:
+                priorities[tid] -= 5000.0          # 已达标: 不再重复
+            else:
+                # 未达标 (含无估计): 给重试加成 (高于普通目标, 低于必观测锚定).
+                priorities[tid] += 300.0
+        for tid in self.attempted_ids:
+            if tid not in priorities:
+                continue                                # 不可见: 无需调权
+            if tid in required_ids:
+                continue                                # 必观测已单独处理
+            if tid not in self.observed_ids:
+                priorities[tid] -= 100.0                # 尝试过但未命中: 轻微回避
+        # 记录"未完成必观测"集合 (达标阈值判定), 供视场加成与必观测锚定使用.
         unfinished = set()
         for tid in required_ids:
-            g_est = self.required_best_g.get(tid)
-            if g_est is None:
-                # 无分数估计: 未命中过即视为未完成
+            g_upper = self.achieved_g.get(tid)
+            if g_upper is None:
                 if tid not in self.observed_ids:
                     unfinished.add(tid)
-            elif g_est < req_threshold:
+            elif g_upper < req_threshold:
                 unfinished.add(tid)
         self._required_unfinished = unfinished
         ranked = sorted(visible, key=lambda t: priorities.get(t.target_id, 0.0), reverse=True)
@@ -1115,8 +1142,8 @@ class Planner:
             alt = altaz[tid][0]
             tq = self._time_quality(t, alt) if t is not None else 0.0
             attempts = self.required_attempts.get(tid, 0)
-            g_est = self.required_best_g.get(tid, 0.0)
-            retry = 1.0 if (attempts > 0 and g_est < 0.5) else 0.0
+            g_upper = self.achieved_g.get(tid, 0.0)
+            retry = 1.0 if (attempts > 0 and g_upper < 0.5) else 0.0
             return (-(tq + 0.15 * retry), tid)
 
         visible_unfinished.sort(key=rank_key)
@@ -1132,7 +1159,7 @@ class Planner:
             max_alt = self._transit_altitude(t.dec_deg)
             alt = altaz[tid][0]
             near_transit = max_alt <= 0 or alt >= self.required_defer_frac * max_alt
-            retry = self.required_attempts.get(tid, 0) > 0 and self.required_best_g.get(tid, 0.0) < 0.5
+            retry = self.required_attempts.get(tid, 0) > 0 and self.achieved_g.get(tid, 0.0) < 0.5
             if near_transit or retry:
                 gated.append(tid)
         # 若门控后为空 (全部目标都处于低仰角), 则回退到全部可见未完成目标.
@@ -1360,8 +1387,8 @@ class Planner:
                 # 短曝光在当时的天气/时段下落空; 增大所需曝光 (重试升级), 提高成功
                 # 概率. 升级系数随尝试次数增长, 上限 1.5 倍.
                 prior = self.required_attempts.get(str(tid), 0)
-                g_est = self.required_best_g.get(str(tid), 0.0)
-                if prior > 0 and g_est < 0.5:
+                g_upper = self.achieved_g.get(str(tid), 0.0)
+                if prior > 0 and g_upper < 0.5:
                     need = int(need * min(1.5, 1.0 + 0.25 * prior))
                 required_need = max(required_need, need)
             seconds.append(suggested)

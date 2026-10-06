@@ -43,7 +43,7 @@ class LLMConfig:
     base_url: str = "https://api.openai.com/v1"         # 来源: OPENAI_BASE_URL
     model: str = "gpt-4o-mini"                          # 来源: OPENAI_MODEL
     timeout_seconds: float = 30.0
-    max_tokens: int = 800
+    max_tokens: int = 1500
     temperature: float = 0.2
     provider: str = "openai"                            # 用于日志标注服务商
     enabled: bool = True                                # False 时强制静态回退

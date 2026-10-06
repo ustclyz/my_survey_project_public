@@ -160,12 +160,54 @@ class LLMClient:
         ]
 
     @staticmethod
-    def _parse_content(text: str) -> Dict[str, Any]:
-        match = _JSON_OBJECT.search(text or "")
-        if not match:
+    def _extract_json(text: str) -> Optional[str]:
+        """从可能的回复文本中稳健地抽出第一个**平衡**的 JSON 对象字符串.
+
+        兼容: 前后有解释文字、```json 代码块、以及带嵌套对象/字符串内花括号的情况.
+        比贪婪正则 ``\\{.*\\}`` 更稳 (后者在多个对象或截断时会取错).
+        """
+        if not text:
+            return None
+        # 去掉 markdown 代码围栏
+        text = text.replace("```json", "```").replace("```", " ")
+        start = text.find("{")
+        while start != -1:
+            depth = 0
+            in_str = False
+            escape = False
+            for i in range(start, len(text)):
+                ch = text[i]
+                if in_str:
+                    if escape:
+                        escape = False
+                    elif ch == "\\":
+                        escape = True
+                    elif ch == '"':
+                        in_str = False
+                    continue
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return text[start:i + 1]
+            # 未闭合: 尝试下一个 '{'
+            start = text.find("{", start + 1)
+        return None
+
+    @classmethod
+    def _parse_content(cls, text: str) -> Dict[str, Any]:
+        candidate = cls._extract_json(text)
+        if candidate is None:
+            # 退路: 原有正则 (兼容极端情况)
+            match = _JSON_OBJECT.search(text or "")
+            candidate = match.group(0) if match else None
+        if not candidate:
             raise LLMError("回复中未找到 JSON 对象")
         try:
-            parsed = json.loads(match.group(0))
+            parsed = json.loads(candidate)
         except json.JSONDecodeError as exc:
             raise LLMError(f"回复 JSON 解析失败: {exc}") from exc
         if not isinstance(parsed, dict):
@@ -191,7 +233,14 @@ class LLMClient:
             raise LLMError(f"{name}: {exc}") from exc
         content = ""
         try:
-            content = resp.choices[0].message.content or ""
+            msg = resp.choices[0].message
+            content = msg.content or ""
+            # 推理模型 (如 deepseek-v4-pro) 可能把正文放在 reasoning_content 或
+            # content 为空时把结果放在别处; 兜底再取一次.
+            if not content:
+                content = getattr(msg, "reasoning_content", "") or ""
+            if not content:
+                content = str(resp)
         except Exception:
             content = str(resp)
         return self._parse_content(content)
@@ -228,7 +277,13 @@ class LLMClient:
         except (urllib.error.URLError, OSError) as exc:
             raise RetryableError(type(exc).__name__) from exc
         try:
-            content = data["choices"][0]["message"]["content"] or ""
+            msg = data["choices"][0]["message"]
+            content = (msg.get("content") or "").strip()
+            if not content:
+                # 推理模型兜底: reasoning_content 或整段回退
+                content = (msg.get("reasoning_content") or "").strip()
+            if not content:
+                content = json.dumps(data, ensure_ascii=False)
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMError(f"回复结构异常: {exc}") from exc
         return self._parse_content(content)
