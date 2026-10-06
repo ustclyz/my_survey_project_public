@@ -660,3 +660,79 @@ def test_budget_adaptive_wait_defers_night_skip_until_empty():
     p._empty_waits_in_night = 0                   # 刚入夜
     a1 = p._wait_action(now, start, end, "test")
     assert a1.until_utc is None, "刚入夜不应跳到下一夜"
+
+
+# ---------------------------------------------------------------------------
+# 任务卡解析 (平台 card_id -> 仓库目录名) 回归
+# ---------------------------------------------------------------------------
+
+
+def test_card_slug_candidates_cover_platform_and_practice_ids():
+    from agent import _card_slug_candidates
+
+    # 正式赛: A / A1 -> cardA / cardA1 (同时保留原样)
+    assert _card_slug_candidates("A")[:2] == ["A", "a"]
+    assert "cardA" in _card_slug_candidates("A")
+    assert "cardA1" in _card_slug_candidates("A1")
+    # 练习卡: 原样即可命中
+    assert _card_slug_candidates("alpha")[0] == "alpha"
+    # 空值 / 残缺输入不应抛异常
+    assert _card_slug_candidates("") == []
+    assert _card_slug_candidates(None) == []
+
+
+def test_resolve_card_accepts_platform_card_id():
+    """平台下发 card_id='C' 时必须解析到仓库目录 cards/cardC.
+
+    回归背景: 此前 agent 直接把 card_id 当作目录名, 'C' 匹配不到 'cardC',
+    于是整场退化为"无卡配置", 光纤几何与计分基准全部用错。
+    """
+    from agent import _resolve_card
+
+    class _Init:
+        def __init__(self, card_id):
+            self.card_id = card_id
+
+    assert _resolve_card(_Init("C")).name == "cardC"
+    assert _resolve_card(_Init("cardD")).name == "cardD"
+    assert _resolve_card(_Init("alpha")).name == "alpha"
+    # 仓库中确实不存在的卡 (A1-D1) 仍应安全返回 None, 由 Planner 用 payload 兜底
+    assert _resolve_card(_Init("A1")) is None
+    assert _resolve_card(_Init("")) is None
+
+
+def test_runtime_grid_uses_payload_fiber_area_without_card_file():
+    """找不到卡片文件时, 光纤几何必须取自 payload 的 fiber_area, 而非硬编码 0.4."""
+    import math as _math
+
+    from protocol import parse_initialize
+
+    init = parse_initialize({
+        "message_type": "initialize",
+        "payload": {
+            "task_card": {"card_id": "C1"},            # 仓库无 cards/cardC1
+            "site": {"latitude_deg": 19.8207, "longitude_deg": -155.4681,
+                     "minimum_altitude_deg": 30.0, "sun_altitude_limit_deg": -18.0},
+            "survey": {"start_utc": "2026-12-02T05:00:00Z", "end_utc": "2026-12-02T18:00:00Z",
+                       "slot_seconds": 900,
+                       "nights": [{"night_id": "N1", "night_date": "2026-12-01",
+                                   "observing_start_utc": "2026-12-02T05:00:00Z",
+                                   "observing_end_utc": "2026-12-02T18:00:00Z", "slot_count": 52}]},
+            "instrument": {"n_fibers": 9, "grid_side": 3, "fiber_area_deg2": 0.7, "gap_deg": 0.0,
+                           "exposure": {"min_duration_seconds": 60, "max_duration_seconds": 3600}},
+            "scoring": {"q0": 0.68, "flux_zero_point": 0.5, "exposure_zero_point_seconds": 900},
+            "targets": {"columns": ["target_id", "ra_deg", "dec_deg", "target_class",
+                                     "feature_flux", "science_weight", "required"],
+                        "rows": [["T1", 20.0, 10.0, "QSO", 0.6, 1.0, True]]},
+            "limits": {"global_wallclock_seconds": 900, "response_max_bytes": 524288},
+        },
+    })
+    tool = planner_mod.PlannerTool(None)      # 模拟"未找到卡片文件"
+    p = planner_mod.Planner(init, tool, llm_planner=None)
+
+    assert p.tool.card is not None, "无卡片文件时应构造运行期卡片兜底"
+    assert p._fiber_grid.side == 3
+    assert p._fiber_grid.n_fibers == 9
+    assert abs(p._fiber_grid.fiber_side_deg - _math.sqrt(0.7)) < 1e-9, "必须用 payload 的 fiber_area"
+    # 计分基准也要来自 payload (而非默认 0.5/900)
+    assert p.tool.card.score_config.get("flux_zero_point") == 0.5

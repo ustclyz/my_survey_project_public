@@ -35,18 +35,36 @@ from planner import Planner, PlannerTool, load_card_for
 from protocol import InitializeData, DecisionRequest, log, parse_initialize, parse_decision_request, read_messages, send_response
 
 
+def _card_slug_candidates(card_id: str):
+    """把平台下发的 card_id 映射为可能的卡片目录名 (按优先级去重).
+
+    正式赛下发的 ``card_id`` 是 ``A`` / ``B`` / ``C`` / ``D`` / ``A1`` ...,
+    而仓库中的卡片目录名是 ``cardA`` / ``cardB`` / ...; 练习卡则直接叫
+    ``alpha`` / ``beta`` / ...。这里同时尝试"原样"与"加 card 前缀"两种写法,
+    避免因命名不一致而误判为"找不到任务卡"。
+    """
+    raw = str(card_id or "").strip()
+    if not raw:
+        return []
+    candidates = []
+    for variant in (raw, raw.lower(), raw.upper(),
+                    "card" + raw, "card" + raw.upper(), "card" + raw.lower()):
+        if variant and variant not in candidates:
+            candidates.append(variant)
+    return candidates
+
+
 def _resolve_card(init_data: InitializeData):
     """尝试定位对应的任务卡 (供 preplan 复用); 找不到返回 None."""
     card_id = init_data.card_id
-    if not card_id:
-        slug = ""
-    else:
-        slug = card_id
-    card = load_card_for(slug) if slug else None
-    if card is None:
-        # 回退: 用 public 目录下的目标直接规划 (无卡配置)
-        log(f"agent: 未找到任务卡 '{slug}', 将仅使用协议 payload 的目标数据")
-    return card
+    for slug in _card_slug_candidates(card_id):
+        card = load_card_for(slug)
+        if card is not None:
+            log(f"agent: 任务卡已加载 card_id={card_id!r} -> {card.name!r}")
+            return card
+    log(f"agent: 未找到任务卡 {card_id!r} (尝试过 {_card_slug_candidates(card_id)}); "
+        f"将使用协议 payload 中的目标与仪器参数")
+    return None
 
 
 def main() -> int:

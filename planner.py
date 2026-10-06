@@ -347,6 +347,13 @@ class Planner:
         self.grid_side = init_data.grid_side
         self.slot_seconds = init_data.slot_seconds
 
+        # 平台正式赛下发的 card_id 是 A/B/C/D/A1…, 而仓库目录名是 cardA/cardB/…:
+        # agent 侧可能解析不到卡片文件。此时用 initialize payload 里的仪器与计分参数
+        # 构造一个"运行期卡片", 保证光纤几何与曝光基准取自真实卡配置, 而不是退回
+        # 硬编码的 0.4 deg² (曾使 B/C/D 及 A1-D1 的视场大小算错)。
+        if self.tool.card is None:
+            self.tool.card = self._runtime_card_from_payload()
+
         self.targets = _TargetTable()
         self._load_targets()
 
@@ -449,15 +456,75 @@ class Planner:
                 loaded += 1
         self.log(f"planner: 载入 {loaded} 个目标 (协议={bool(self.init.target_rows)}, 卡片={self.tool.card.name if self.tool.card else None})")
 
+    def _runtime_card_from_payload(self) -> preplan.CardData:
+        """用 initialize payload 的仪器/计分参数构造"运行期卡片".
+
+        正式赛的 card_id (A/B/C/D/A1…) 与仓库目录名 (cardA/cardB/…) 不一致,
+        或该卡本身未随仓库下发 (A1-D1) 时, 用它替代缺失的卡片文件, 使
+        ``build_fiber_grid`` / ``suggest_exposure_seconds`` 仍使用**真实**的
+        光纤布局与计分基准 (fiber_area_deg2 / grid_side / flux_zero_point /
+        exposure_zero_point_seconds), 而不是硬编码默认值。
+
+        目标仍以协议 payload 为准 (这里 ``targets`` 留空, 由 ``_load_targets``
+        从 payload 填入), 因此不会改变目标集合。
+        """
+        instrument = self.init.instrument if isinstance(self.init.instrument, dict) else {}
+        exposure = instrument.get("exposure") or {}
+        try:
+            area = float(instrument.get("fiber_area_deg2", 0.4) or 0.4)
+        except (TypeError, ValueError):
+            area = 0.4
+        try:
+            gap = float(instrument.get("gap_deg", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            gap = 0.0
+        try:
+            min_exp = int(exposure.get("min_duration_seconds", self.min_exposure))
+        except (TypeError, ValueError):
+            min_exp = self.min_exposure
+        try:
+            max_exp = int(exposure.get("max_duration_seconds", self.max_exposure))
+        except (TypeError, ValueError):
+            max_exp = self.max_exposure
+        fiber_config = {
+            "schema_version": "v4-fiber-map-v1",
+            "site": {"latitude_deg": self.lat, "longitude_deg": self.lon},
+            "field": {"n_fibers": self.n_fibers, "fiber_area_deg2": area, "gap_deg": gap},
+            "exposure": {"min_duration_seconds": min_exp, "max_duration_seconds": max_exp},
+        }
+        score_config = self.init.scoring if isinstance(self.init.scoring, dict) else {}
+        name = self.init.card_id or "runtime"
+        self.log(f"planner: 无卡片文件, 用 payload 构造运行期卡片 {name!r} "
+                 f"(光纤 {self.n_fibers} 根, 单根 {area} deg^2, 网格 {self.grid_side}x{self.grid_side})")
+        return preplan.CardData(
+            name=name,
+            root=preplan.PROJECT_ROOT,
+            targets=[],
+            fiber_config=fiber_config,
+            score_config=score_config,
+            footprint_vertices={},
+        )
+
     def _build_grid(self) -> preplan.FiberGrid:
         card = self.tool.card
         if card is not None:
             return preplan.build_fiber_grid(card)
+        # 理论上不会走到这里 (__init__ 已用 payload 兜底); 兜底时也按 payload 计算,
+        # 不硬编码 0.4, 否则非 4x4 / 非 0.4 deg² 的卡几何会算错。
+        instrument = self.init.instrument if isinstance(self.init.instrument, dict) else {}
+        try:
+            area = float(instrument.get("fiber_area_deg2", 0.4) or 0.4)
+        except (TypeError, ValueError):
+            area = 0.4
+        try:
+            gap = float(instrument.get("gap_deg", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            gap = 0.0
         return preplan.FiberGrid(
             side=self.grid_side,
             n_fibers=self.n_fibers,
-            fiber_side_deg=math.sqrt(0.4),
-            gap_deg=0.0,
+            fiber_side_deg=math.sqrt(max(area, 1e-9)),
+            gap_deg=gap,
         )
 
     # -- 决策入口 ----------------------------------------------------------
