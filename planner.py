@@ -805,16 +805,33 @@ class Planner:
         return self._next_night_start(now) is None
 
     def _site_closed(self, req) -> bool:
-        notices = self._all_notices(req)
-        for n in notices:
-            kind = n.get("event_kind")
-            direction = n.get("direction")
-            if kind in ("rain", "storm") and direction == "ALL":
+        """当前是否因雨/暴风**全天关闭** (只依据当前简报).
+
+        重要: 只用 ``latest_bulletin`` (逐 slot 下发, 代表"此刻") 判定是否关闭。
+        ``latest_forecast`` 是**一周展望**, 其 notice 带 ``nights[]`` (例如
+        "12-04 那一夜可能下雨"), 而且会持续数日; 若拿它来关闭站点, agent 会在
+        整周内一直等待、一枪不发 (公开测试卡 PT 实测: 253 轮全 wait、0 观测)。
+
+        预报仍会通过 :meth:`_all_notices` 交给规划/LLM (见 ``_build_state``),
+        只是**不再触发"立刻关闭"**。
+        """
+        bulletin = req.latest_bulletin
+        if not isinstance(bulletin, dict):
+            return False
+        for n in (bulletin.get("notices") or []):
+            if not isinstance(n, dict):
+                continue
+            if n.get("event_kind") in ("rain", "storm") and n.get("direction") == "ALL":
                 return True
         return False
 
     @staticmethod
     def _all_notices(req) -> List[Dict[str, Any]]:
+        """汇总简报与预报的 notices (供规划/LLM 参考, **不**用于判定"此刻关闭").
+
+        预报 notice 常带 ``nights[]`` 与覆盖时段, 描述的是未来一周的展望, 不能
+        等价于"现在关闭"; 关闭判定请用 :meth:`_site_closed` (仅看简报)。
+        """
         notices: List[Dict[str, Any]] = []
         for src in (req.latest_bulletin, req.latest_forecast):
             if isinstance(src, dict):

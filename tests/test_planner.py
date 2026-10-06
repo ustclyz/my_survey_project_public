@@ -738,3 +738,77 @@ def test_runtime_grid_uses_payload_fiber_area_without_card_file():
     assert abs(p._fiber_grid.fiber_side_deg - _math.sqrt(0.7)) < 1e-9, "必须用 payload 的 fiber_area"
     # 计分基准也要来自 payload (而非默认 0.5/900)
     assert p.tool.card.score_config.get("flux_zero_point") == 0.5
+
+
+# ---------------------------------------------------------------------------
+# 站点关闭判定: 周预报(一周展望)不得触发"此刻关闭" (回归)
+# ---------------------------------------------------------------------------
+
+
+def _closed_req(bulletin_notices=None, forecast_notices=None,
+                now="2026-10-02T02:00:00Z", end="2026-10-08T09:00:00Z"):
+    from protocol import DecisionRequest
+
+    return DecisionRequest({
+        "decision_sequence": 1,
+        "payload": {
+            "now_utc": now,
+            "survey_end_utc": end,
+            "wallclock": {"remaining_seconds": 900, "remaining_real_cpu_seconds": 900,
+                          "wall_remaining_seconds": 1800},
+            "latest_bulletin": (None if bulletin_notices is None else
+                                {"record_type": "bulletin", "notices": bulletin_notices}),
+            "latest_forecast": (None if forecast_notices is None else
+                                {"record_type": "forecast",
+                                 "coverage_start_utc": "2026-10-02T00:00:00Z",
+                                 "coverage_end_utc": "2026-10-08T00:00:00Z",
+                                 "notices": forecast_notices}),
+            "active_requests": [], "new_messages": [], "last_result": None,
+        },
+    })
+
+
+def test_site_closed_uses_bulletin_only_not_forecast():
+    """回归: 周预报里 "某夜 rain/ALL" 不得让当前夜整夜关闭.
+
+    背景: 公开测试卡 PT 上, 预报(一周展望)带 rain+ALL 触发 _site_closed,
+    导致 253 轮全 wait、0 观测、0 分。预报是未来展望(带 nights[]), 不能
+    等价于"现在关闭"; 只有逐 slot 的**当前简报**才能。
+    """
+    p, _ = _make_planner_with_card("alpha")
+    far_rain = [{"event_kind": "rain", "direction": "ALL", "nights": ["2026-10-08"]}]
+
+    # 预报(未来某夜有雨) + 当前简报无 notice -> 不得关闭
+    assert p._site_closed(_closed_req(bulletin_notices=[], forecast_notices=far_rain)) is False
+    # 只有预报、没有简报 -> 不得关闭
+    assert p._site_closed(_closed_req(bulletin_notices=None, forecast_notices=far_rain)) is False
+    # 当前简报本身 rain/ALL -> 应当关闭 (正确行为)
+    assert p._site_closed(_closed_req(bulletin_notices=[{"event_kind": "rain", "direction": "ALL"}])) is True
+    # storm/ALL 同理
+    assert p._site_closed(_closed_req(bulletin_notices=[{"event_kind": "storm", "direction": "ALL"}])) is True
+    # 简报报雨但只是某个方向 -> 不关闭
+    assert p._site_closed(_closed_req(bulletin_notices=[{"event_kind": "rain", "direction": "NE"}])) is False
+    # 没有任何消息 -> 不关闭
+    assert p._site_closed(_closed_req(bulletin_notices=None, forecast_notices=None)) is False
+
+    # _all_notices 仍应把预报并入 (供 _build_state / LLM 规划参考), 只是不再用于关闭判定
+    req = _closed_req(bulletin_notices=[{"event_kind": "haze", "direction": "W"}],
+                      forecast_notices=far_rain)
+    assert len(p._all_notices(req)) == 2
+
+
+def test_decide_does_not_idle_all_night_for_forecast_rain():
+    """端到端: 只有周预报提到 rain/ALL 时, decide() 不应返回"全天天雨/暴风"的等待."""
+    p, nights = _make_planner_with_card("alpha")
+    n = nights[0]
+    start = datetime.fromisoformat(n["observing_start_utc"].replace("Z", "+00:00")).astimezone(timezone.utc)
+    end = datetime.fromisoformat(n["observing_end_utc"].replace("Z", "+00:00")).astimezone(timezone.utc)
+
+    req = _closed_req(
+        bulletin_notices=[],
+        forecast_notices=[{"event_kind": "rain", "direction": "ALL", "nights": ["2026-10-20"]}],
+        now=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        end=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    action = p.decide(req)
+    assert "全天天雨/暴风" not in (action.reason or ""), "预报不得触发整夜关闭"
