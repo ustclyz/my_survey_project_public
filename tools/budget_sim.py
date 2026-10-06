@@ -173,6 +173,9 @@ def run_card(card_name: str, budget: float = DEFAULT_BUDGET_SECONDS,
             waits += 1
             if action.until_utc:
                 target = _parse_utc(action.until_utc)
+                if target <= now:
+                    # 兜底: 时间戳被截断到秒后可能与 now 相同, 导致推进不动而空转
+                    target = now + timedelta(seconds=900)
                 now = target
                 last_result = {"action": "wait"}
                 continue

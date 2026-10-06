@@ -76,17 +76,26 @@ COMPLETION_Q_SCALE = 0.65
 # 反复失败的目标挤出局 (实测卡B: 161 个必观测全场可见却一次都没被指派)。
 REQUIRED_FIELD_DOMINANCE = 100000.0
 # 重试加成只给前 N 次尝试; 之后转为抑制, 避免失败目标长期挤占新鲜目标。
-RETRY_BONUS = 300.0
+# 注意: 重试的边际收益 (把一个 g=0.3 的目标抬到 0.6, +0.3 分) 低于"拍一个从未
+# 拍过的目标" (+~0.7 分), 所以新鲜目标的加成必须高于重试 —— 实测卡A 曾出现
+# "覆盖 24,491 个目标却打了 5,959 枪 (2.4 倍重复)"的浪费。
+RETRY_BONUS = 100.0
 RETRY_BONUS_MAX_ATTEMPTS = 2
 STALE_PENALTY = 200.0
 # 从未尝试过的可见目标获得加成 (覆盖优先, 防止"只啃硬骨头")。
-FRESH_BONUS = 150.0
+FRESH_BONUS = 300.0
 # 必观测锚定冷却: 刚锚定过的目标让位给其它未完成必观测 (轮转, 避免饿死)。
 ANCHOR_COOLDOWN_DECISIONS = 3
 # 每个目标的尝试次数硬上限: 反复失败后不再参与本轮选择, 把时间让给新鲜目标。
 # (实测卡A1: 11 个目标被拍 ≥50 次而 2.6 万个目标从没被碰过 -> 只覆盖 3,445 个目标)
 MAX_ATTEMPTS_NORMAL = 3
 MAX_ATTEMPTS_REQUIRED = 8      # 必观测单个值 50 分, 允许更多次尝试
+
+# 曝光时长的候选集合 (秒)。选场时按"单位时间收益 value/T"在其中择优。
+# 依据: 官方示例在练习卡上的回放里, 曝光时长分布是 300/450/600/900/1200/1500/
+# 1800/2400/3000/3600 (中位 600s, 均值 847s), 且每目标得分在 1200~1800s 就已到顶
+# (1800s 之后几乎零增益) —— 而我们的平均曝光是 2084s, 纯属浪费。
+DURATION_CANDIDATES = (300, 450, 600, 900, 1200, 1500, 1800, 2400, 3600)
 
 
 def _julian_date(moment: datetime) -> float:
@@ -416,6 +425,12 @@ class Planner:
             (_parse_utc(n.get("observing_start_utc")), _parse_utc(n.get("observing_end_utc")))
             for n in self.init.nights
         ]
+        # "可观测时间占比": 夜长之和 / 巡天日历跨度。用于把"剩余日历时间"折算成
+        # "剩余可观测秒数", 供曝光时长的预算平摊使用。
+        _obs_total = sum((e - s).total_seconds() for s, e in self._nights if s and e)
+        _span = ((init_data.end_utc - init_data.start_utc).total_seconds()
+                 if (init_data.end_utc and init_data.start_utc) else 0.0)
+        self._observing_fraction = (_obs_total / _span) if _span > 0 else 1.0
         # 目标可见性/地平坐标索引: 一次性算好 h_max 等, 之后每轮只做数组比较。
         self._sky = TargetIndex(self.targets.targets, self.lat, self.min_alt + ALT_MARGIN_DEG)
         # 每轮只算一次的可见性快照 (供 _build_state 与 _plan_observe 复用)
@@ -435,6 +450,7 @@ class Planner:
         self.perf_fill_calls = 0      # 本轮 _fill_pointing 调用次数
         self.perf_visible_n = 0       # 本轮可见目标数
         self._cpu_mark: Optional[float] = None
+        self._remaining_cpu: Optional[float] = None   # 本轮的剩余真实 CPU 秒
         self.decision_cpu_total = 0.0
         self.decision_cpu_count = 0
 
@@ -476,6 +492,10 @@ class Planner:
         mid_lo = (side - 1) // 2
         mid_hi = side // 2
         self._anchor_fibers = [r * side + c for r in (mid_lo, mid_hi) for c in (mid_lo, mid_hi)]
+        # 探测用的"中心光纤": 必须随网格尺寸变化。原先是硬编码的 5 (只对 4x4 成立),
+        # 对 10x10 会取到 (row0, col5) —— 网格最上一排, 反推出的探测中心偏离视场中心
+        # 4.5 个格, 稠密探测因此选到"空天区", 实测卡D 每次曝光只能填 2 根光纤。
+        self._center_fiber = self._anchor_fibers[0]
 
         # -- 时序感知调度 (time-aware scheduling) ----------------------------
         # 单个目标的得分随时间近似"抛物线"(过中天/transit 时最佳, 高度角最高、
@@ -506,7 +526,7 @@ class Planner:
         # 锚点搜索参数 (预算与质量的折中); 会按剩余 CPU 预算自适应缩小
         self.anchor_pool = 160          # 快速探测的锚点上限
         self.refine_anchors = 4         # 精细搜索的最密锚点数
-        self._center_fiber = 5          # 快速探测使用的中心光纤 (靠中间)
+        # (中心光纤已在上面按网格尺寸算出: self._center_fiber = self._anchor_fibers[0])
         self.pace_level = 0             # 0=充裕 1=适中 2=紧张
         self.per_decision_cpu = float("inf")  # 每决策可用的 CPU 秒 (预算保护)
         self._empty_waits_in_night = 0  # 本夜连续"无目标"等待轮数 (用于跳夜判据)
@@ -622,6 +642,8 @@ class Planner:
             self.decision_cpu_total += cpu - self._cpu_mark
             self.decision_cpu_count += 1
         self._cpu_mark = cpu
+        # 剩余真实 CPU 秒 (供曝光时长的 CPU 预算下限使用)
+        self._remaining_cpu = req.remaining_real_cpu_seconds()
         self.perf_fill_calls = 0
         self._snapshot = None       # 每轮重新取快照 (同轮内多次调用会命中缓存)
 
@@ -1740,93 +1762,105 @@ class Planner:
 
     def _choose_duration(self, assignments, seconds_left: float, altaz, lst, now=None,
                          extra_must_complete: Optional[set] = None) -> int:
-        """选择曝光时长.
+        """按"单位时间收益"选择曝光时长 (value/T 贪心).
 
-        策略 (参考 Cao 2025 的曝光时间计算器思想):
-            * 对**必须完成**的目标 (必观测 + 限时请求目标), 计算"达到完成因子
-              threshold=0.5 所需的最短曝光", 取所需最长者且不缩放;
-            * 普通目标用 preplan 的建议曝光 (以计分基准曝光为锚, 按亮度缩放);
-            * **预算紧张时** (pace >= 1) 把曝光拉长到"本视场最后一个目标饱和"的
-              时长 —— 同一枪内所有目标共享曝光时间, 延长到最暗目标饱和既不掉分,
-              又能显著减少决策次数 (这是 CPU 预算的第二杠杆);
-            * 最后裁剪到 [min, max]、剩余时间, 以及"目标掉出高度门槛之前"。
+        依据 (官方示例在练习卡上的决策回放): 它的曝光时长中位 600s / 均值 847s,
+        分布集中在 300~1800s; 且每目标得分在 1200~1800s 就已到顶 (之后几乎零增益)。
+        我们原先的平均曝光是 2084s —— 时间是巡天里唯一稀缺资源, 这直接导致只能
+        覆盖 47% 的目标 (官方 100%)。
 
-        完成因子模型 (公开部分):  g = flux * T * Q / (f0*T0),
-        其中 Q ≈ (η·τ·K·L)/(seeing·X^β)/q0. 隐藏项 η·τ·K/s 未知, 这里用一个
-        偏保守但合理的公开估计 Q_hat = L/(q0·X^β·seeing_ref) (seeing_ref 取典型值),
-        以便在常见天气下把必观测推到 0.5 以上.
+        做法 (两条约束取小):
+            1. **饱和时长**: 本视场目标达到 g≈1 所需的时长 (取 85 分位, 不让一个
+               暗目标把整场拖长)——再长也不会多拿一分;
+            2. **时间预算**: 把"剩余可观测时间"平摊给"还没覆盖的目标":
+               T_budget = 剩余可观测秒数 / 还需覆盖的目标数 x 每次填充数。
+               这保证"尽量拍全": 时间紧就缩短曝光换覆盖, 时间宽裕才允许拍长。
+        必须完成的目标 (必观测 / 限时请求) 另设下限: T ≥ 达标所需时长。
+        最后裁剪到 [min, max]、剩余时间, 以及"目标掉出高度门槛之前"。
         """
         must_complete = set(extra_must_complete or ())
-        seconds = []
-        required_need = 0        # 本视场中"必须完成"目标所需的最短曝光 (不缩放)
-        # 月球只计算一次 (供所有必观测目标的完成因子估算复用).
-        moon = None
         scoring = self.init.scoring if isinstance(self.init.scoring, dict) else {}
         f0 = float(scoring.get("flux_zero_point", 0.5)) or 0.5
         t0 = float(scoring.get("exposure_zero_point_seconds", 900.0)) or 900.0
-        needs_moon = any(
-            (self.targets.index.get(tid) is not None
-             and (self.targets.index[tid].required or tid in must_complete))
-            for tid in assignments.values()
-        )
-        if now is not None and needs_moon:
+        try:
+            miss_penalty = float((scoring.get("required") or {}).get("penalty_per_missing", 50.0))
+        except (TypeError, ValueError):
+            miss_penalty = 50.0
+
+        # 月球只算一次 (供视场内所有目标的质量估计复用)
+        moon = None
+        if now is not None and assignments:
             try:
                 moon = _Moon(now, lst, self.lat)
             except Exception:
                 moon = None
+
+        field = []              # [(target, q_expect, t_half, is_must), ...]
+        must_need = 0.0
         for tid in assignments.values():
             t = self.targets.index.get(tid)
             if t is None:
                 continue
-            suggested = preplan.suggest_exposure_seconds(
-                preplan.Target(t.target_id, t.ra_deg, t.dec_deg, t.target_class,
-                               t.feature_flux, t.science_weight, t.required),
-                self.tool._temp_card([t]),
-            )
-            if t.required or tid in must_complete:
-                need = self._exposure_for_completion(t, altaz.get(tid), moon)
-                # 时序感知重试升级: 若该必观测目标此前已尝试但未完成, 说明一次
-                # 短曝光在当时的天气/时段下落空; 增大所需曝光 (重试升级), 提高成功
-                # 概率. 升级系数随尝试次数增长, 上限 1.5 倍.
+            pair = altaz.get(tid)
+            q_exp = self._quality_hat(t, pair, moon)
+            must = bool(t.required) or str(tid) in must_complete
+            t_half = 0.0
+            if must:
+                need = self._exposure_for_completion(t, pair, moon)
+                # 重试升级: 已尝试但未达标的必观测目标加大曝光 (上限 1.5x)
                 prior = self.required_attempts.get(str(tid), 0)
                 g_upper = self.achieved_g.get(str(tid), 0.0)
                 if prior > 0 and g_upper < 0.5:
                     need = int(need * min(1.5, 1.0 + 0.25 * prior))
-                required_need = max(required_need, need)
-            seconds.append(suggested)
-        base = max(seconds) if seconds else 900
-        normal_duration = int(round(base * self.duration_scale / 30.0) * 30)
-        duration = normal_duration
-        if required_need > 0:
-            # 必观测目标所需时长优先且不缩放; 若 need 已超过 max_exposure 的 60%,
-            # 说明该目标较暗, 直接给满 max_exposure, 提高成功概率.
-            required_duration = required_need
-            if required_need >= 0.6 * self.max_exposure:
-                required_duration = self.max_exposure
-            duration = max(duration, required_duration)
+                must_need = max(must_need, float(need))
+                q_cons = self._quality_hat(t, pair, moon, conservative=True)
+                if q_cons > 0.0:
+                    t_half = 0.5 * f0 * t0 / (max(1e-6, t.feature_flux) * q_cons)
+            field.append((t, q_exp, t_half, must))
+        if not field:
+            return self.min_exposure
 
-        # -- 预算紧张: 拉长到"本视场最后一个目标饱和"的时长, 减少决策次数 -------
-        if self.pace_level >= 1 and now is not None and assignments:
-            t_sat = 0.0
-            for tid in assignments.values():
-                t = self.targets.index.get(tid)
-                if t is None:
-                    continue
-                q_hat = self._quality_hat(t, altaz.get(tid), moon)
-                if q_hat <= 0.0:
-                    continue
-                t_sat = max(t_sat, f0 * t0 / (max(1e-6, t.feature_flux) * q_hat))
-            if t_sat > duration:
-                duration = min(self.max_exposure, int(round(t_sat / 30.0) * 30))
+        # 1) 饱和时长 (85 分位): 超过它这一枪不再多拿分, 但也不用为了一个暗目标拖长全场
+        t_sats = []
+        for t, q_exp, _t_half, _must in field:
+            if q_exp > 0.0 and t.feature_flux > 0.0:
+                t_sats.append(f0 * t0 / (t.feature_flux * q_exp))
+        t_sat_field = float(self.max_exposure)
+        if t_sats:
+            t_sats.sort()
+            t_sat_field = t_sats[min(len(t_sats) - 1, int(0.85 * (len(t_sats) - 1)))]
 
-        duration = max(self.min_exposure, min(self.max_exposure, duration))
-        duration = int(max(self.min_exposure, min(duration, seconds_left)))
-        # 预算紧张时才拉长曝光; 既然拉长了, 就用"目标掉出高度门槛之前"给个安全上限
-        # (否则一次长曝光可能中途跌破 30 度, 整枪 0 分)。pace 0 (预算充裕) 不启用,
-        # 保持与既有节奏一致。
-        if self.pace_level >= 1:
-            runway = self._altitude_runway_seconds(assignments, lst)
-            duration = int(max(self.min_exposure, min(duration, runway, seconds_left)))
+        # 2) 时间预算: 剩余可观测时间 / "还没拍过的目标数" x 本场填充数
+        # 注意用"从未被指派过"(attempted_ids) 而不是"未达标": 后者在末期会趋近
+        # 于把曝光压到最短, 反而把 CPU 预算烧光 (实测卡D 只跑完 63% 的时间)。
+        remaining_targets = max(1, len(self.targets.targets) - len(self.attempted_ids))
+        fill = max(1.0, float(len(assignments)))
+        obs_needed = max(1.0, remaining_targets / fill)
+        obs_left = self._observing_seconds_left(now)
+        t_budget = float(self.max_exposure) if obs_left is None else max(
+            float(self.min_exposure), obs_left / obs_needed)
+
+        duration = int(min(t_sat_field, t_budget))
+        if must_need > 0.0:
+            duration = max(duration, int(math.ceil(must_need / 30.0) * 30.0))
+        # 3) CPU 预算下限: 曝光不能短到"剩余观测时间需要的决策数"超出剩余 CPU。
+        # (评分只算 agent 的 CPU; 决策越密 CPU 越高 —— 实测把曝光砍短后卡B 只跑完
+        #  48% 的时间就因为 CPU 顶格而中止)
+        cpu_left = self._remaining_cpu
+        if cpu_left is not None and cpu_left > 0.0:
+            if self.decision_cpu_count > 0:
+                per_dec = self.decision_cpu_total / self.decision_cpu_count
+            else:
+                per_dec = 0.12
+            per_dec = max(0.02, min(0.60, per_dec))
+            n_max = max(1.0, cpu_left / per_dec)
+            obs_left = self._observing_seconds_left(now)
+            if obs_left and obs_left > 0.0:
+                duration = max(duration, int(math.ceil(obs_left / n_max / 30.0) * 30.0))
+        duration = int(max(self.min_exposure, min(self.max_exposure, min(duration, seconds_left))))
+        # 安全上限: 别让一次曝光中途把目标拖到高度门槛以下 (那会让整枪 0 分)
+        runway = self._altitude_runway_seconds(assignments, lst)
+        duration = int(max(self.min_exposure, min(duration, runway, seconds_left)))
         return duration
 
     def _altitude_runway_seconds(self, assignments, lst: float) -> float:
@@ -1844,6 +1878,20 @@ class Planner:
         if best == float("inf"):
             return 1e9
         return max(60.0, best * 0.9)
+
+    def _observing_seconds_left(self, now) -> Optional[float]:
+        """从 ``now`` 到巡天结束还剩多少"可观测秒数" (按夜长占比折算).
+
+        用于曝光时长的预算平摊: 时间紧就缩短单次曝光换取覆盖面。
+        返回 ``None`` 表示无法判断 (调用方按"不限"处理)。
+        """
+        end = self.init.end_utc
+        if now is None or end is None:
+            return None
+        span = (end - now).total_seconds()
+        if span <= 0:
+            return 0.0
+        return span * max(0.0, min(1.0, self._observing_fraction))
 
     def _quality_hat(self, target: Target, altaz_pair, moon,
                      conservative: bool = False) -> float:
