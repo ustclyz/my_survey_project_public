@@ -33,6 +33,31 @@ from models import LLMConfig
 # 服务商前缀, 按优先级排列. 第一个提供了 API key 的胜出.
 _PROVIDER_PREFIXES: Tuple[str, ...] = ("OPENAI", "KIMI", "DEEPSEEK", "MOONSHOT")
 
+# 前缀虽常见但接口不是 OpenAI 兼容的, 本客户端不支持, 不参与自动发现。
+_NON_OPENAI_COMPATIBLE = ("ANTHROPIC",)
+
+
+def provider_candidates() -> List[str]:
+    """按优先级返回候选服务商前缀.
+
+    顺序: 先 OPENAI / KIMI / DEEPSEEK / MOONSHOT (与官方示例一致), 再自动发现
+    环境里**任意**其它 ``{PREFIX}_API_KEY``。后者很重要: 平台的
+    "密钥与网络 -> 添加模型服务" 支持自定义前缀 (``survey26 env model --prefix
+    SOAD`` 会写入 ``SOAD_API_KEY/_BASE_URL/_MODEL``), 只认固定的几个前缀会让
+    这些配置被静默忽略, 智能体整场退化为无 LLM。
+    """
+    known = set(_PROVIDER_PREFIXES)
+    suffix = "_API_KEY"
+    extra = sorted({
+        name[: -len(suffix)]
+        for name in os.environ
+        if name.endswith(suffix)
+        and len(name) > len(suffix)
+        and name[: -len(suffix)] not in known
+        and name[: -len(suffix)] not in _NON_OPENAI_COMPATIBLE
+    })
+    return [*_PROVIDER_PREFIXES, *extra]
+
 # 各组前缀的默认 base_url / model (当对应环境变量缺失时使用).
 _DEFAULTS = {
     "OPENAI": ("https://api.openai.com/v1", "gpt-4o-mini"),
@@ -96,20 +121,21 @@ def load_config() -> RuntimeConfig:
     """
     chosen_prefix = ""
     api_key = ""
-    for prefix in _PROVIDER_PREFIXES:
+    for prefix in provider_candidates():
         key = _env(f"{prefix}_API_KEY")
         if key:
             chosen_prefix, api_key = prefix, key
             break
 
-    # 允许 KIMI_API_KEY 作为 OPENAI_API_KEY 的后备 (官方示例行为)
-    if not api_key:
-        api_key = _env("KIMI_API_KEY")
-
     default_base, default_model = _DEFAULTS.get(chosen_prefix, _DEFAULTS["OPENAI"])
-    # base_url / model: 优先用与胜出前缀匹配的变量, 其次用通用 OPENAI_*
-    base_url = _env(f"{chosen_prefix}_BASE_URL") or _env("OPENAI_BASE_URL", default_base) if chosen_prefix else _env("OPENAI_BASE_URL", default_base)
-    model = _env(f"{chosen_prefix}_MODEL") or _env("OPENAI_MODEL", default_model) if chosen_prefix else _env("OPENAI_MODEL", default_model)
+    # base_url / model: 优先本前缀自己的变量, 其次通用 OPENAI_*, 最后内置默认值。
+    # (KIMI_API_KEY 作 OPENAI_API_KEY 后备的旧逻辑已被 provider_candidates 覆盖。)
+    if chosen_prefix:
+        base_url = _env(f"{chosen_prefix}_BASE_URL") or _env("OPENAI_BASE_URL", default_base)
+        model = _env(f"{chosen_prefix}_MODEL") or _env("OPENAI_MODEL", default_model)
+    else:
+        base_url = _env("OPENAI_BASE_URL", default_base)
+        model = _env("OPENAI_MODEL", default_model)
 
     timeout = _safe_float(_env("LLM_TIMEOUT_SECONDS"), 30.0)
 
