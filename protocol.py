@@ -44,6 +44,18 @@ _OPTIONAL_FIELDS = {"reason", "decision_source"}
 
 PROGRAMS = ("DARK", "BRIGHT", "BACKUP")
 
+# 协议输出流: 默认 None (运行时取当前 sys.stdout, 便于测试捕获). agent.py 启动时
+# 调用 bind_protocol_stdout() 保存真实 stdout, 并把 sys.stdout 重定向到 stderr,
+# 从而保证**只有**协议消息写到 stdout, 任何意外 print / 第三方库输出都落入 stderr.
+_PROTOCOL_STREAM = None
+
+
+def bind_protocol_stdout(stream) -> None:
+    """绑定协议输出到指定的真实 stdout 流 (agent 启动时调用)."""
+    global _PROTOCOL_STREAM
+    _PROTOCOL_STREAM = stream
+
+
 
 # ---------------------------------------------------------------------------
 # 日志 (stderr)
@@ -251,14 +263,22 @@ def send_response(decision_sequence: int, action: Action) -> None:
         encoded = json.dumps(envelope, ensure_ascii=True, separators=(",", ":"))
 
     try:
-        # 显式以 UTF-8 字节写 stdout, 不依赖 locale 编码 (Windows GBK 下也安全).
+        # 显式以 UTF-8 字节写**绑定的协议流**(真实 stdout), 不依赖 locale 编码
+        # (Windows GBK 下也安全). 不直接写 sys.stdout —— 后者可能已被重定向到
+        # stderr 以避免非协议输出污染 stdout.
         data = (encoded + "\n").encode("utf-8")
-        try:
-            sys.stdout.buffer.write(data)
-            sys.stdout.buffer.flush()
-        except (AttributeError, ValueError):
-            # stdout 被替换为非 buffer 流 (如测试捕获) 时回退到 print
-            print(encoded, flush=True)
+        stream = _PROTOCOL_STREAM if _PROTOCOL_STREAM is not None else sys.stdout
+        buf = getattr(stream, "buffer", None)
+        if buf is not None:
+            buf.write(data)
+            buf.flush()
+        else:
+            # 流没有 buffer (如测试捕获的 StringIO) 时回退到 write
+            try:
+                stream.write(encoded + "\n")
+                stream.flush()
+            except Exception:
+                print(encoded, flush=True)
     except Exception as exc:  # noqa: BLE001
         log(f"protocol: 写 stdout 失败 ({exc})")
     _log_response(action, envelope)
