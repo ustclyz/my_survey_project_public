@@ -2,9 +2,7 @@
   "schema_version": "observer-project-v1",
   "protocol": "jsonl-v4",
   "image": "python:3.12-slim",
-  "build": [
-    ["pip", "install", "--no-cache-dir", "--target", ".deps", "-r", "requirements.txt"]
-  ],
+  "build": [],
   "run": ["python3", "-u", "agent.py"],
   "working_directory": ".",
   "environment": {
