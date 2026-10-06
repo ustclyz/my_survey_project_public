@@ -71,10 +71,14 @@ MAX_CONTINUITY_CENTERS = 8        # 连续性种子每轮最多生成的候选�
 REQUEST_BONUS = 800.0             # 限时观测请求目标的优先级加成
 REQUEST_BONUS_URGENT = 1200.0     # 距截止不足 1 夜时的加成
 
-# 曝光估算的保守系数: 公开模型缺 η/τ/K/seeing 真值, 实测(卡B)表明原估计偏乐观
-# 15~40% (106 个必观测卡在 g∈[0.40,0.50)), 这里把估计质量乘以该系数,
-# 等价于把"达标所需曝光"放大约 1/0.65 ≈ 1.54 倍。
-COMPLETION_Q_SCALE = 0.65
+# 曝光估算的保守系数 (初值): 公开模型缺 η/τ/K/seeing 真值。实测(卡B)真实质量只有
+# 我们估计值的 ~0.56 倍 (170 个必观测卡在 g∈[0.40,0.50)), 所以这里先用一个偏保守
+# 的初值, 之后用 hits[].score 的反馈**在线标定** (见 _update_calibration)。
+COMPLETION_Q_SCALE = 0.55
+# 在线标定: 用"实测完成因子 / 预测完成因子"的中位数估计 Q_true/Q_hat, 并夹在区间内。
+CALIB_MIN = 0.30
+CALIB_MAX = 1.20
+CALIB_MIN_SAMPLES = 12
 
 # 必观测视场的"硬优先"权重: 只要视场含 1 个未完成必观测, 其质量就必须压过任何
 # 不含必观测的视场 (含"重试堆"视场, 后者 16x(11+300) ≈ 5000), 否则必观测会被
@@ -454,6 +458,12 @@ class Planner:
         # -- 性能计数 (只写 stderr 日志 / 本地预算仿真, 不影响决策) -------------
         self.perf_fill_calls = 0      # 本轮 _fill_pointing 调用次数
         self.perf_visible_n = 0       # 本轮可见目标数
+        # -- 曝光标定的在线反馈 ------------------------------------------------
+        # 记录"本次预测的完成因子", 与平台返回的 hits[].score 对比即可估计真实质量
+        # 与我们的估计相差多少 (Q_true/Q_hat), 用于把必观测的达标曝光自动调到够用。
+        self._pred_g: Dict[str, float] = {}
+        self._calib_samples: List[float] = []
+        self._calib_q: Optional[float] = None
         self._cpu_mark: Optional[float] = None
         self._remaining_cpu: Optional[float] = None   # 本轮的剩余真实 CPU 秒
         self.decision_cpu_total = 0.0
@@ -818,6 +828,20 @@ class Planner:
                             score = 0.0
                         g_upper = max(0.0, score / max(1e-6, t.science_weight))
                         self.achieved_g[tid] = max(self.achieved_g.get(tid, 0.0), g_upper)
+                        # 在线标定: 用"实测完成因子 / 预测完成因子"估计真实天空质量
+                        # 与我们估计值之比 (hits[].score = w·g·m, 所以 score/w 是 g 的上界)
+                        pred = self._pred_g.pop(tid, None)
+                        if pred and pred > 1e-9 and g_upper > 0.0:
+                            ratio = g_upper / pred
+                            if 0.05 < ratio < 5.0:
+                                self._calib_samples.append(ratio)
+                                if len(self._calib_samples) > 200:
+                                    del self._calib_samples[:100]
+                                if len(self._calib_samples) >= CALIB_MIN_SAMPLES:
+                                    srt = sorted(self._calib_samples)
+                                    med = srt[len(srt) // 2]
+                                    # 除以 1.15: score/w = g·m 且 m ∈ [1.0,1.2], 留一点余量
+                                    self._calib_q = min(CALIB_MAX, max(CALIB_MIN, med / 1.15))
             for tid in (lr.get("assigned_target_ids") or []):
                 self.attempted_ids.add(str(tid))
         if lr and lr.get("action") == "report":
@@ -1440,6 +1464,16 @@ class Planner:
             tid = str(tid)
             self.attempted_ids.add(tid)
             self.attempt_count[tid] = self.attempt_count.get(tid, 0) + 1
+            # 记录预测完成因子, 供 _update_result 在线标定真实天空质量
+            _t = self.targets.index.get(tid)
+            if _t is not None:
+                _q = self._quality_hat(_t, altaz.get(tid), None)
+                try:
+                    _f0 = float((self.init.scoring or {}).get("flux_zero_point", 0.5)) or 0.5
+                    _t0 = float((self.init.scoring or {}).get("exposure_zero_point_seconds", 900.0)) or 900.0
+                except (TypeError, ValueError):
+                    _f0, _t0 = 0.5, 900.0
+                self._pred_g[tid] = _t.feature_flux * float(duration) * _q / (_f0 * _t0)
             # 时序感知: 记录必观测目标的尝试次数, 供重试优先级与曝光升级使用.
             if tid in required_ids:
                 self.required_attempts[tid] = self.required_attempts.get(tid, 0) + 1
@@ -1977,7 +2011,10 @@ class Planner:
         if moon is not None:
             lunar = _lunar_factor(moon, target.ra_deg, target.dec_deg, lunar_model)
         q = lunar / (q0 * (airmass ** beta) * max(1e-6, SEEING_REF_FOR_SCORING))
-        return q * (COMPLETION_Q_SCALE if conservative else 1.0)
+        if conservative:
+            # 优先用在线标定值 (来自 hits[].score 的反馈), 没有样本时用保守初值
+            q *= self._calib_q if self._calib_q is not None else COMPLETION_Q_SCALE
+        return q
 
     def _exposure_for_completion(self, target: Target, altaz_pair, moon, threshold: float = 0.5) -> int:
         """估算某目标达到完成因子 ``threshold`` 所需的曝光秒数 (公开模型, 无隐藏真值).
