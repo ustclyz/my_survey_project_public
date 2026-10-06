@@ -90,6 +90,13 @@ PLAN_Q = _env("PLAN_Q", 0.7)                  # typical quality for the season p
 KAPPA = _env("KAPPA", 1.0)                    # convex shaping of science value (1 = linear)
 REQUIRED_SAFE_FACTOR = 0.62                   # a required target counts as safe at this estimated factor
 DONE_FACTOR = 0.95                            # other targets are done at this factor
+# Hard-mode 修正: 官方 pro 对必观测目标的奖励按"当前估计质量下的达标概率"给, 一旦
+# 天空质量被压低 (仪器故障 / 未公告坏天气 / Hard 事件), 概率估计趋近 0, 于是**完全
+# 放弃**必观测目标 —— 实测卡 A1: 1500 个必观测只完成约 750 个, 直接 -37,700 罚分,
+# 总分被拖成负数。而"必观测漏一个 -50"远高于一次曝光的机会成本 (约 1 分), 只要还有
+# 一丁点成功概率就该继续重试 (好窗口是间歇出现的: 实测约 11% 的曝光落在高质量时段,
+# 一旦落到就能完成整场 16 个目标)。这里给未完成必观测的概率加一个下限。
+REQUIRED_FLOOR_P = _env("REQUIRED_FLOOR_P", 0.35)
 # --- pointing offset (Hard-mode cards: a fixed, unannounced offset; its size is not published) ---
 OFFSET_STEPS = 16                             # coarse grid half-width in steps of pitch/12 (about a third of the field);
                                               # the grid widens by half whenever the best offset sits on its edge
@@ -757,13 +764,13 @@ class Planner:
                 g *= PARTIAL_DISCOUNT   # it will be completed later: this partial exposure would be wasted
             if self.required[i] and self.factor[i] < 0.5:
                 raw = self.flux[i] * T * model * self.scale / self.f0t0 / 0.5 * self.req_calib.get(i, 1.0)
-                bonus = REQUIRED_BONUS * min(1.0, max(0.0, (raw - REQ_P_LO) / (REQ_P_HI - REQ_P_LO)))
+                p = min(1.0, max(0.0, (raw - REQ_P_LO) / (REQ_P_HI - REQ_P_LO)))
                 target_best = self.best_future_model(i, night_index) if REQ_CALENDAR else self.ideal_model[i]
                 if REQ_TIMING and model < REQ_TIMING * target_best and self.last_night[i] - night_index >= REQ_TIMING_NIGHTS:
-                    bonus *= REQ_TIMING_DISCOUNT   # a better moment for this target will come
+                    p *= REQ_TIMING_DISCOUNT       # a better moment for this target will come
                 if self.bad_forecast and self.last_night[i] - night_index >= REQ_TIMING_NIGHTS:
-                    bonus *= FORECAST_DISCOUNT     # tonight is forecast bad over the whole sky
-                g += bonus
+                    p *= FORECAST_DISCOUNT         # tonight is forecast bad over the whole sky
+                g += REQUIRED_BONUS * max(p, REQUIRED_FLOOR_P)
             if i in self.request_bonus:
                 threshold = self.request_threshold.get(i, 0.5)
                 raw = self.flux[i] * T * model * self.scale / self.f0t0 / max(1e-6, threshold)
@@ -783,7 +790,8 @@ class Planner:
                 g *= PARTIAL_DISCOUNT
             if self.required[i] and self.factor[i] < 0.5:
                 raw = self.flux[i] * T * model * self.scale / self.f0t0 / 0.5
-                g += REQUIRED_BONUS * min(1.0, max(0.0, (raw - REQ_P_LO) / (REQ_P_HI - REQ_P_LO)))
+                p = min(1.0, max(0.0, (raw - REQ_P_LO) / (REQ_P_HI - REQ_P_LO)))
+                g += REQUIRED_BONUS * max(p, REQUIRED_FLOOR_P)
             if i in self.request_bonus:
                 raw = self.flux[i] * T * model * self.scale / self.f0t0 / max(1e-6, self.request_threshold.get(i, 0.5))
                 g += self.request_bonus[i] * min(1.0, max(0.0, (raw - REQ_P_LO) / (REQ_P_HI - REQ_P_LO)))
