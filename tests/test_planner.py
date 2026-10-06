@@ -668,17 +668,19 @@ def test_budget_adaptive_wait_defers_night_skip_until_empty():
 
 
 def test_card_slug_candidates_cover_platform_and_practice_ids():
-    from agent import _card_slug_candidates
+    # 注意: 从 planner 导入 (而非 agent) —— 导入 agent 会触发 stdout 硬化,
+    # 污染同进程内 protocol 的 stdout 纯净性测试。
+    candidates = planner_mod.card_slug_candidates
 
     # 正式赛: A / A1 -> cardA / cardA1 (同时保留原样)
-    assert _card_slug_candidates("A")[:2] == ["A", "a"]
-    assert "cardA" in _card_slug_candidates("A")
-    assert "cardA1" in _card_slug_candidates("A1")
+    assert candidates("A")[:2] == ["A", "a"]
+    assert "cardA" in candidates("A")
+    assert "cardA1" in candidates("A1")
     # 练习卡: 原样即可命中
-    assert _card_slug_candidates("alpha")[0] == "alpha"
+    assert candidates("alpha")[0] == "alpha"
     # 空值 / 残缺输入不应抛异常
-    assert _card_slug_candidates("") == []
-    assert _card_slug_candidates(None) == []
+    assert candidates("") == []
+    assert candidates(None) == []
 
 
 def test_resolve_card_accepts_platform_card_id():
@@ -687,18 +689,18 @@ def test_resolve_card_accepts_platform_card_id():
     回归背景: 此前 agent 直接把 card_id 当作目录名, 'C' 匹配不到 'cardC',
     于是整场退化为"无卡配置", 光纤几何与计分基准全部用错。
     """
-    from agent import _resolve_card
+    resolve = planner_mod.resolve_card
 
     class _Init:
         def __init__(self, card_id):
             self.card_id = card_id
 
-    assert _resolve_card(_Init("C")).name == "cardC"
-    assert _resolve_card(_Init("cardD")).name == "cardD"
-    assert _resolve_card(_Init("alpha")).name == "alpha"
+    assert resolve(_Init("C")).name == "cardC"
+    assert resolve(_Init("cardD")).name == "cardD"
+    assert resolve(_Init("alpha")).name == "alpha"
     # 仓库中确实不存在的卡 (A1-D1) 仍应安全返回 None, 由 Planner 用 payload 兜底
-    assert _resolve_card(_Init("A1")) is None
-    assert _resolve_card(_Init("")) is None
+    assert resolve(_Init("A1")) is None
+    assert resolve(_Init("")) is None
 
 
 def test_runtime_grid_uses_payload_fiber_area_without_card_file():
