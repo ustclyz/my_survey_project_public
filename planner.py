@@ -40,6 +40,11 @@ from models import Action, DecisionState, NightPlan, Target
 from protocol import log
 from skyindex import HAVE_NUMPY, TargetIndex
 
+try:  # numpy 为可选加速
+    import numpy as _np
+except Exception:  # pragma: no cover
+    _np = None
+
 # ---------------------------------------------------------------------------
 # 天文几何 (标准公式, 与官方示例一致)
 # ---------------------------------------------------------------------------
@@ -1251,10 +1256,29 @@ class Planner:
         # 空间分箱索引 (按 (alt,az) 分箱): 让 _fill_pointing 只遍历视场附近的少量目标,
         # 在大卡 (数万目标 / 100 光纤) 上把每轮决策从 O(N) 降到 O(局部).
         _bin = max(1.0, self._fiber_grid.fov_side_deg)
-        index = self._build_spatial_index(ranked, altaz, _bin)
-        order = {t.target_id: i for i, t in enumerate(ranked)}
-        # cache: 同一轮内按 (alt,az) 分箱缓存"邻域目标", 供几十~上百次候选评估复用
-        spatial = {"bin_deg": _bin, "index": index, "order": order, "cache": {}}
+        if _np is not None and ranked:
+            # numpy 邻域查询上下文: 数组按 ranked 顺序排列, 于是"下标顺序 == 优先级
+            # 顺序", 取邻域时一次布尔掩码即可, 不必再建分箱索引/归并排序。
+            n_ranked = len(ranked)
+            alt_a = _np.empty(n_ranked, dtype=float)
+            az_a = _np.empty(n_ranked, dtype=float)
+            for i, t in enumerate(ranked):
+                pair = altaz.get(t.target_id)
+                if pair is None:
+                    alt_a[i] = -999.0
+                    az_a[i] = 0.0
+                else:
+                    alt_a[i], az_a[i] = pair
+            alt_sorted = _np.sort(alt_a)
+            order_by_alt = _np.argsort(alt_a, kind="stable")
+            spatial = {"bin_deg": _bin,
+                       "ctx": {"targets": ranked, "alt": alt_a, "az": az_a,
+                               "alt_sorted": alt_sorted, "order_by_alt": order_by_alt}}
+        else:
+            index = self._build_spatial_index(ranked, altaz, _bin)
+            order = {t.target_id: i for i, t in enumerate(ranked)}
+            # cache: 同一轮内按 (alt,az) 分箱缓存"邻域目标", 供多次候选评估复用
+            spatial = {"bin_deg": _bin, "index": index, "order": order, "cache": {}}
 
         best = None  # 兼容旧变量: 最终为 (quality, c_alt, c_az, assignments)
         seen_centers = set()
@@ -1640,7 +1664,11 @@ class Planner:
         used = set()
         total = 0.0
         if spatial is not None:
-            candidates_iter = self._nearby_targets(spatial, center_alt, center_az, half * 1.6)
+            ctx = spatial.get("ctx")
+            if ctx is not None:
+                candidates_iter = self._nearby_targets_np(ctx, center_alt, center_az, half * 1.6)
+            else:
+                candidates_iter = self._nearby_targets(spatial, center_alt, center_az, half * 1.6)
         else:
             candidates_iter = ranked
         for t in candidates_iter:
@@ -1689,6 +1717,39 @@ class Planner:
 
     @staticmethod
     def _nearby_targets(spatial, center_alt: float, center_az: float, radius_deg: float):
+        """旧版(分箱+归并)邻域查询; 仅在无 numpy 时使用。"""
+        return Planner._nearby_targets_dict(spatial, center_alt, center_az, radius_deg)
+
+    @staticmethod
+    def _nearby_targets_np(ctx, center_alt: float, center_az: float, radius_deg: float):
+        """numpy 版邻域查询: 返回视场附近目标, **下标顺序即优先级顺序**.
+
+        比"分箱 + heapq.merge + 排序"快一个量级: 一次布尔掩码 + nonzero 即可
+        (数组是按 ranked 顺序排的, 所以取出的下标天然按优先级有序)。
+        """
+        r = float(radius_deg) * 1.15
+        # 按高度角二分定位候选区间 (数组已预排序), 只对邻域内的少量目标做方位角过滤,
+        # 避免每次调用都扫描全部可见目标 —— 实测 52 次/决策时这是主要开销。
+        alt_sorted = ctx["alt_sorted"]
+        c_alt = float(center_alt)
+        lo = int(_np.searchsorted(alt_sorted, c_alt - r, side="left"))
+        hi = int(_np.searchsorted(alt_sorted, c_alt + r, side="right"))
+        if hi <= lo:
+            return []
+        idx = ctx["order_by_alt"][lo:hi]
+        # 方位角窗口要"按 cos(高度角) 放宽": _fill_pointing 内部用的是 cos 缩放后的
+        # 方位角距离, 这里必须比它更宽松, 否则会漏掉高仰角附近的目标。
+        r_az = min(180.0, r / max(0.25, math.cos(math.radians(max(-80.0, min(80.0, c_alt))))))
+        d_az = _np.abs((ctx["az"][idx] - float(center_az) + 180.0) % 360.0 - 180.0)
+        idx = idx[d_az <= r_az]
+        if idx.size == 0:
+            return []
+        idx = _np.sort(idx)          # 恢复优先级顺序 (数组下标即优先级)
+        targets = ctx["targets"]
+        return [targets[i] for i in idx.tolist()]
+
+    @staticmethod
+    def _nearby_targets_dict(spatial, center_alt: float, center_az: float, radius_deg: float):
         """从分箱索引中取视场附近的目标 (3x3 邻域即可覆盖半径内所有目标).
 
         性能: 一轮里会评估几十到上百个候选中心, 其中很多落在同一个 (alt,az) 分箱,
