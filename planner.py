@@ -390,11 +390,27 @@ class Planner:
         # 未完成必观测目标"的硬加成. 该加成直接进入视场质量, 不参与连续性折中.
         self._required_unfinished: set = set()
         self.required_field_bonus = 400.0       # 每个未完成必观测目标的视场加成
+        # 时序门控: 未完成必观测仅在"当前高度角 >= 中天高度角的该比例"时才优先锚定
+        # (把低仰角窗口让给普通目标), 但重试目标不受限. 实测该门控在部分卡上会推迟
+        # 必观测、反而增加漏失, 故默认关闭 (0.0); 保留参数便于按卡调参.
+        self.required_defer_frac = 0.0
         # 必观测锚定使用的中心光纤 (靠近网格中心的若干根), 用于反推指向.
         side = self.grid_side
         mid_lo = (side - 1) // 2
         mid_hi = side // 2
         self._anchor_fibers = [r * side + c for r in (mid_lo, mid_hi) for c in (mid_lo, mid_hi)]
+
+        # -- 时序感知调度 (time-aware scheduling) ----------------------------
+        # 单个目标的得分随时间近似"抛物线"(过中天/transit 时最佳, 高度角最高、
+        # 大气质量最小; 参见 Cao 2025 AJ 170,88). 因此对必观测目标应尽量安排在其
+        # **最佳时段**(中天附近 + 暗夜), 而非"可见即观测". 同时记录尝试次数与已达成
+        # 的完成因子, 对"尝试过但未完成"的目标进行**重试**并加大曝光.
+        self.required_attempts: Dict[str, int] = {}     # 必观测目标已尝试次数
+        self.required_best_g: Dict[str, float] = {}      # 必观测目标已达成的最好完成因子
+        self._required_transit_alt: Dict[str, float] = {}  # 目标当日中天高度角 (缓存)
+        self._required_transit_lst: Dict[str, float] = {}  # 目标中天时的 LST
+        # 时序加成的权重 (叠加到必观测锚点的视场质量上, 使其在最佳时段更易胜出).
+        self.time_aware_weight = 600.0
 
         # -- LLM 调用节流 (900s 预算保护, 任务书第 6.3 条成败项) --------------
         # decide_action(环节B) 不是每轮都调: 仅在关键点或周期性调用, 其余轮次用
@@ -591,6 +607,18 @@ class Planner:
                 tid = h.get("target_id") if isinstance(h, dict) else None
                 if tid:
                     self.observed_ids.add(str(tid))
+                    # 时序感知: 记录必观测目标已达成的最好完成因子估计.
+                    # 引擎返回的 hits[].score = c = w·g·m (m∈[1.0,1.2]); 这里以
+                    # g_est = score / (w·1.2) 作保守下界估计, 用于判断是否已达 0.5.
+                    t = self.targets.index.get(str(tid))
+                    if t is not None and t.required:
+                        try:
+                            score = float(h.get("score", 0.0))
+                        except (TypeError, ValueError):
+                            score = 0.0
+                        denom = max(1e-6, t.science_weight * 1.2)
+                        g_est = max(0.0, score / denom)
+                        self.required_best_g[str(tid)] = max(self.required_best_g.get(str(tid), 0.0), g_est)
             for tid in (lr.get("assigned_target_ids") or []):
                 self.attempted_ids.add(str(tid))
         if lr and lr.get("action") == "report":
@@ -819,11 +847,33 @@ class Planner:
             if tid in priorities and tid not in required_ids:
                 priorities[tid] -= 200.0
         # 记录"未完成必观测"集合, 供视场加成与必观测锚定使用.
-        self._required_unfinished = required_ids - self.observed_ids
+        # 判定: 必观测目标若已有估计完成因子 >= 0.5 才算完成; 否则需继续尝试
+        # (漏一个 -50). 没有分数估计时, 退化为"是否曾命中".
+        req_threshold = float((self.init.scoring or {}).get("required", {}).get(
+            "observed_factor_threshold", 0.5)) if isinstance(self.init.scoring, dict) else 0.5
+        unfinished = set()
+        for tid in required_ids:
+            g_est = self.required_best_g.get(tid)
+            if g_est is None:
+                # 无分数估计: 未命中过即视为未完成
+                if tid not in self.observed_ids:
+                    unfinished.add(tid)
+            elif g_est < req_threshold:
+                unfinished.add(tid)
+        self._required_unfinished = unfinished
         ranked = sorted(visible, key=lambda t: priorities.get(t.target_id, 0.0), reverse=True)
 
         # 预计算每个目标的 alt/az (避免重复计算)
         altaz = {t.target_id: radec_to_altaz(t.ra_deg, t.dec_deg, lst, self.lat) for t in ranked}
+
+        # 空间分箱索引 (按 (alt,az) 分箱): 让 _fill_pointing 只遍历视场附近的少量目标,
+        # 在大卡 (数万目标 / 100 光纤) 上把每轮决策从 O(N) 降到 O(局部).
+        _bin = max(1.0, self._fiber_grid.fov_side_deg)
+        spatial = {
+            "bin_deg": _bin,
+            "index": self._build_spatial_index(ranked, altaz, _bin),
+            "order": {t.target_id: i for i, t in enumerate(ranked)},
+        }
 
         best = None  # 兼容旧变量: 最终为 (quality, c_alt, c_az, assignments)
         seen_centers = set()
@@ -855,7 +905,7 @@ class Planner:
             c_alt, c_az = shift_altaz(a_alt, a_az, -d_north, -d_east)
             if not (self.min_alt + 1.0 <= c_alt <= 89.0):
                 continue
-            assignments, total = self._fill_pointing(ranked, priorities, altaz, c_alt, c_az)
+            assignments, total = self._fill_pointing(ranked, priorities, altaz, c_alt, c_az, spatial)
             if assignments:
                 dense_centers.append((total + 50.0 * len(assignments), anchor, d_north, d_east))
         if not dense_centers:
@@ -870,7 +920,7 @@ class Planner:
             if key in seen_centers:
                 return
             seen_centers.add(key)
-            assignments, total = self._fill_pointing(ranked, priorities, altaz, c_alt, c_az)
+            assignments, total = self._fill_pointing(ranked, priorities, altaz, c_alt, c_az, spatial)
             if not assignments:
                 return
             # 必观测完成加成: 该视场能覆盖的"未完成必观测目标"数量, 直接计入质量,
@@ -881,10 +931,17 @@ class Planner:
             quality -= self._repeat_pointing_penalty(c_alt, c_az)
             candidates.append((quality, c_alt, c_az, assignments))
 
-        # 精细搜索: 对最密的若干锚点, 尝试全部光纤中心偏移
+        # 精细搜索: 对最密的若干锚点, 尝试光纤中心偏移. 大网格 (如 10x10=100 光纤)
+        # 时对光纤采样, 避免 refine x n_fibers 的候选爆炸 (预算保护).
+        max_fine_fibers = 36
+        if self.n_fibers <= max_fine_fibers:
+            fine_fibers = range(self.n_fibers)
+        else:
+            fstep = max(1, self.n_fibers // max_fine_fibers)
+            fine_fibers = list(range(0, self.n_fibers, fstep))[:max_fine_fibers]
         for _, anchor, _, _ in dense_centers[:refine]:
             a_alt, a_az = altaz[anchor.target_id]
-            for fiber_id in range(self.n_fibers):
+            for fiber_id in fine_fibers:
                 row, col = divmod(fiber_id, self.grid_side)
                 d_north, d_east = self._fiber_grid.cell_center(row, col)
                 c_alt, c_az = shift_altaz(a_alt, a_az, -d_north, -d_east)
@@ -956,7 +1013,11 @@ class Planner:
         if len(self.recent_fields) > self.recent_field_horizon:
             self.recent_fields = self.recent_fields[-self.recent_field_horizon:]
         for tid in assignments.values():
-            self.attempted_ids.add(str(tid))
+            tid = str(tid)
+            self.attempted_ids.add(tid)
+            # 时序感知: 记录必观测目标的尝试次数, 供重试优先级与曝光升级使用.
+            if tid in required_ids:
+                self.required_attempts[tid] = self.required_attempts.get(tid, 0) + 1
         self.log(f"planner: observe 指派 {len(assignments)} 根光纤, 曝光 {duration}s, 程序 {program}, "
                  f"指向 alt={center_alt:.2f} az={center_az:.2f}")
         return action
@@ -1000,37 +1061,96 @@ class Planner:
                 break
         return bonus
 
+    def _transit_altitude(self, dec_deg: float) -> float:
+        """目标中天时的最大高度角 = 90 - |lat - dec| (单位度)."""
+        return 90.0 - abs(self.lat - dec_deg)
+
+    def _time_quality(self, target: Target, alt_deg: float) -> float:
+        """目标当前时刻相对"最佳时段"的质量因子, 取值 (0, 1].
+
+        最佳时段 = 中天附近 (高度角最大, 大气质量最小). 用"当前高度角 / 中天高度角"
+        近似接近中天的程度 (越接近 1 越好). 同时用当前高度角惩罚低仰角. 这是公开
+        几何量, 不依赖隐藏天气; 用于把必观测目标尽量排在其最佳时段.
+        """
+        max_alt = self._transit_altitude(target.dec_deg)
+        if max_alt <= 0.0:
+            return 0.0
+        # 归一化高度角: 目标越低 -> 越接近地平 -> 质量越低.
+        # 结合"离中天多近"和"绝对高度角"两项.
+        near_transit = max(0.0, min(1.0, alt_deg / max(1.0, max_alt)))
+        alt_factor = max(0.0, min(1.0, (alt_deg - self.min_alt) / max(1.0, max_alt - self.min_alt)))
+        return 0.5 * near_transit + 0.5 * alt_factor
+
     def _required_anchor_centers(self, altaz) -> List[Tuple[float, float]]:
-        """为当前可见的**未完成必观测目标**生成候选视场中心.
+        """为当前可见的**未完成必观测目标**生成候选视场中心 (时序感知).
 
         对每个未完成必观测目标, 生成若干"能让它落入某根光纤"的中心 (以其为锚点,
-        用光纤中心偏移反推指向). 这样即使该目标孤立、周围密度低, 也会作为候选被
-        评估, 配合 :attr:`required_field_bonus` 提高其被选中的概率.
+        用光纤中心偏移反推指向). 排序时按"时序质量 × 紧迫度"优先: 越接近其最佳时段
+        (中天/高仰角)、以及尝试过但未完成的目标 (需重试), 越优先被锚定.
+        """
+        return self._required_anchor_centers_impl(altaz)
+
+    def _required_anchor_centers_impl(self, altaz) -> List[Tuple[float, float]]:
+        """时序感知的必观测锚定实现.
+
+        排序依据 (从高到低):
+            1. 时序质量: 当前时刻越接近目标的中天/高仰角越好 (Cao 2025: 得分随
+               高度角近似抛物线);
+            2. 重试紧迫度: 尝试过但未完成的目标优先 (需在更好时段重试);
+            3. target_id 稳定排序 (确定性).
+
+        每轮最多锚定 ``max_anchor`` 个目标, 控制候选规模与计算预算.
         """
         centers: List[Tuple[float, float]] = []
         if not self._required_unfinished:
             return centers
-        # 只用少量中心光纤 (4x4 的中间 4 根) 反推指向, 兼顾密度与成本.
         fiber_ids = self._anchor_fibers
-        # 每轮最多锚定 max_anchor 个未完成必观测目标 (按可见性/优先级取前若干),
-        # 控制候选规模与计算预算.
         max_anchor = 24
-        anchored = 0
-        # 只锚定"当前可见"的未完成必观测目标 (altaz 中已按可见性过滤);
-        # 按 target_id 排序保证确定性. 其余可见目标由优先级排序的普通锚点覆盖.
-        visible_unfinished = [tid for tid in sorted(self._required_unfinished)
+        # 只锚定"当前可见"的未完成必观测目标.
+        visible_unfinished = [tid for tid in self._required_unfinished
                               if tid in altaz and altaz[tid][0] >= self.min_alt + ALT_MARGIN_DEG]
-        # 若可见的未完成必观测很多, 均匀抽样以覆盖更多目标 (而非固定取前 24 个).
-        if len(visible_unfinished) > max_anchor:
-            stride = len(visible_unfinished) / max_anchor
-            visible_unfinished = [visible_unfinished[int(i * stride)] for i in range(max_anchor)]
+
+        def rank_key(tid: str):
+            t = self.targets.index.get(tid)
+            alt = altaz[tid][0]
+            tq = self._time_quality(t, alt) if t is not None else 0.0
+            attempts = self.required_attempts.get(tid, 0)
+            g_est = self.required_best_g.get(tid, 0.0)
+            retry = 1.0 if (attempts > 0 and g_est < 0.5) else 0.0
+            return (-(tq + 0.15 * retry), tid)
+
+        visible_unfinished.sort(key=rank_key)
+        # 时序感知延迟: 优先只锚定"当前高度角接近其最大值(中天附近)"的目标, 把
+        # 得分不佳的低仰角窗口让给普通目标; 但"重试过仍未完成"的目标不受此限制
+        # (避免因延迟而永远错过).
+        gated = []
         for tid in visible_unfinished:
+            t = self.targets.index.get(tid)
+            if t is None:
+                gated.append(tid)
+                continue
+            max_alt = self._transit_altitude(t.dec_deg)
+            alt = altaz[tid][0]
+            near_transit = max_alt <= 0 or alt >= self.required_defer_frac * max_alt
+            retry = self.required_attempts.get(tid, 0) > 0 and self.required_best_g.get(tid, 0.0) < 0.5
+            if near_transit or retry:
+                gated.append(tid)
+        # 若门控后为空 (全部目标都处于低仰角), 则回退到全部可见未完成目标.
+        candidates_anchor = gated or visible_unfinished
+
+        if len(candidates_anchor) > max_anchor:
+            # 优先保留时序质量最高的一批; 其余均匀抽样以覆盖更多目标.
+            head = candidates_anchor[: max_anchor // 2]
+            rest = candidates_anchor[max_anchor // 2:]
+            stride = max(1, len(rest) // max(1, max_anchor - len(head)))
+            sampled = rest[::stride][: max_anchor - len(head)]
+            candidates_anchor = head + sampled
+        for tid in candidates_anchor:
             a_alt, a_az = altaz[tid]
             for fiber_id in fiber_ids:
                 row, col = divmod(fiber_id, self.grid_side)
                 d_north, d_east = self._fiber_grid.cell_center(row, col)
                 centers.append(shift_altaz(a_alt, a_az, -d_north, -d_east))
-            anchored += 1
         return centers
 
     def _continuity_seed_centers(self, altaz) -> List[Tuple[float, float]]:
@@ -1082,19 +1202,26 @@ class Planner:
         return 0.0
 
 
-    def _fill_pointing(self, ranked, priorities, altaz, center_alt, center_az):
-        """在给定指向下, 贪心填充 16 根光纤, 返回 (assignments, total_priority).
+    def _fill_pointing(self, ranked, priorities, altaz, center_alt, center_az, spatial=None):
+        """在给定指向下, 贪心填充光纤, 返回 (assignments, total_priority).
 
         复用 preplan.FiberGrid.classify; 每根光纤至多一个目标, 目标需全程高于
         最低高度角 (用 ALT_MARGIN 余量近似). 先用 FOV 半径快速排除远处目标,
         再按优先级贪心分配, 保证单次曝光内光纤不重复.
+
+        ``spatial`` 为可选的 (alt,az) 分箱索引: 若提供, 只遍历视场附近的少量目标
+        (O(局部) 而非 O(全部目标)), 在 100 光纤 / 数万目标的大卡上显著提速.
         """
         grid = self._fiber_grid
         half = grid.fov_side_deg / 2.0
         assignments: Dict[str, str] = {}
         used = set()
         total = 0.0
-        for t in ranked:
+        if spatial is not None:
+            candidates_iter = self._nearby_targets(spatial, center_alt, center_az, half * 1.6)
+        else:
+            candidates_iter = ranked
+        for t in candidates_iter:
             if len(assignments) >= self.n_fibers:
                 break
             t_alt, t_az = altaz[t.target_id]
@@ -1121,6 +1248,43 @@ class Planner:
             assignments[str(fiber)] = t.target_id
             total += priorities.get(t.target_id, 0.0)
         return assignments, total
+
+    def _build_spatial_index(self, ranked, altaz, bin_deg: float) -> Dict[Tuple[int, int], list]:
+        """把按优先级降序的目标按 (alt, az) 分箱, 供 _nearby_targets 快速取邻域.
+
+        bin_deg 取略大于视场尺寸, 保证视场内目标落在中心 bin 及其相邻 bin.
+        每箱内保持原 ranked 顺序 (即优先级降序), 便于贪心填充.
+        """
+        index: Dict[Tuple[int, int], list] = {}
+        for t in ranked:
+            pair = altaz.get(t.target_id)
+            if pair is None:
+                continue
+            a, z = pair
+            key = (int(a // bin_deg), int((z % 360.0) // bin_deg))
+            index.setdefault(key, []).append(t)
+        return index
+
+    @staticmethod
+    def _nearby_targets(spatial, center_alt: float, center_az: float, radius_deg: float):
+        """从分箱索引中取视场附近的目标 (3x3 邻域即可覆盖半径内所有目标)."""
+        b = spatial["bin_deg"]
+        # 邻域半径以 bin 为单位 (向上取整, 覆盖 radius_deg)
+        r = int(radius_deg // b) + 1
+        ca = int(center_alt // b)
+        cz = int((center_az % 360.0) // b)
+        n_az_bins = max(1, int(360.0 // b) + 1)
+        seen = []
+        for da in range(-r, r + 1):
+            ai = ca + da
+            for dz in range(-r, r + 1):
+                zi = (cz + dz) % n_az_bins
+                lst = spatial["index"].get((ai, zi))
+                if lst:
+                    seen.extend(lst)
+        # 保持优先级降序: 合并后按原顺序近似即可 (各 bin 内已降序, 这里再排序).
+        seen.sort(key=lambda t: spatial["order"].get(t.target_id, 0.0))
+        return seen
 
     def _estimate_program(self, assignments, altaz, lst, now) -> str:
         """按月亮 + 大气质量模型估计观测程序档位 (纯静态回退时的 DARK/BRIGHT 选择).
@@ -1192,9 +1356,13 @@ class Planner:
             )
             if t.required:
                 need = self._exposure_for_completion(t, altaz.get(tid), moon)
-                # 必观测 (漏一个 -50): 取"达到完成因子 0.5 所需"的最长曝光. 注意该
-                # 时长**不参与 duration_scale 缩放**, 且至少给到 need; 若该目标亮度
-                # 很低 (need 超长), 直接用 max_exposure 以最大化一次成功的概率.
+                # 时序感知重试升级: 若该必观测目标此前已尝试但未完成, 说明一次
+                # 短曝光在当时的天气/时段下落空; 增大所需曝光 (重试升级), 提高成功
+                # 概率. 升级系数随尝试次数增长, 上限 1.5 倍.
+                prior = self.required_attempts.get(str(tid), 0)
+                g_est = self.required_best_g.get(str(tid), 0.0)
+                if prior > 0 and g_est < 0.5:
+                    need = int(need * min(1.5, 1.0 + 0.25 * prior))
                 required_need = max(required_need, need)
             seconds.append(suggested)
         base = max(seconds) if seconds else 900
