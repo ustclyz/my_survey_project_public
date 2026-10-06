@@ -103,6 +103,9 @@ REQUIRED_SCALE_FLOOR = _env("REQUIRED_SCALE_FLOOR", 0.5)
 # Hard-mode 修正 B: 必观测轮转. 反复失败的目标要逐步让位给还没试过的目标, 否则规划器
 # 会永久锚定同几个目标, 既浪费观测又饿死其它必观测 (实测 alpha: req_missing 0 -> 31)。
 REQUIRED_ATTEMPT_DAMP = _env("REQUIRED_ATTEMPT_DAMP", 0.85)
+# Hard-mode 修正 C: 显式轮转锚点. 保证"未完成必观测"按失败次数从少到多轮流成为候选
+# 视场中心, 整个赛季遍历到每一个必观测目标, 而不是只啃最先锚定的那几个。
+REQUIRED_FORCE_ANCHORS = _env("REQUIRED_FORCE_ANCHORS", 6)
 # --- pointing offset (Hard-mode cards: a fixed, unannounced offset; its size is not published) ---
 OFFSET_STEPS = 16                             # coarse grid half-width in steps of pitch/12 (about a third of the field);
                                               # the grid widens by half whenever the best offset sits on its edge
@@ -829,6 +832,19 @@ class Planner:
         ranked.sort(reverse=True)
         n_anchors = (N_ANCHORS, 3, 1, 1)[min(level, 3)]
         anchors = [i for _, i in ranked[:n_anchors]]
+        if REQUIRED_FORCE_ANCHORS > 0:
+            req_open = [i for i in visible if self.required[i] and self.factor[i] < 0.5]
+            if req_open:
+                req_open.sort(key=lambda i: (self.attempts[i], -self.value(i), i))
+                forced = []
+                for i in req_open:
+                    if i in anchors or exact(i) is None:   # 必须先算好 base[i] 才能当锚点
+                        continue
+                    forced.append(i)
+                    if len(forced) >= REQUIRED_FORCE_ANCHORS:
+                        break
+                if forced:
+                    anchors = forced + anchors
         if N_DENSE and level <= 1 and bins:
             # also try the densest patches of remaining science: fields with no single outstanding target
             for _, key in heapq.nlargest(N_DENSE if level == 0 else 2, ((v, k) for k, v in bins.items())):
