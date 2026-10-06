@@ -52,6 +52,14 @@ MAX_PAID_FALSE = _env("MAX_PAID", 6)
 PERSIST_NIGHTS = _env("PERSIST_NIGHTS", 3)
 E_PAID_STEP = _env("E_PAID_STEP", 0.05)   # ... minus this per paid false probe so far
 MAX_FALSE_REPORTS = 8
+# 绝对质量下限的故障判据 (Hard 模式卡的关键). 官方 pro 的 E = 质量/档位 判据在"档位
+# 估计跟着质量一起塌缩"时会失效 (E 恒为 ~1), 仪器故障就长期发现不了。实测卡 A1:
+# 首夜后质量从 Q~0.6 崩到 ~0.004 并持续 100+ 夜, 而 agent 只报修 3 次 (间隔约 30 夜),
+# 导致几乎全部必观测目标完不成 (-37,700)。这里补一条"绝对"判据: 只要近几小时中位
+# scale 远低于晴夜模型 (默认 0.15), 就直接判故障并报修 —— 真故障修好后质量立刻恢复,
+# 报对 +100 且能救回大量必观测目标; 普通卡 (A-D) 的 scale 常年 0.6~1.0, 不会误触发。
+SCALE_FAULT_LEVEL = _env("SCALE_FAULT_LEVEL", 0.15)
+SCALE_FAULT_HOURS = _env("SCALE_FAULT_HOURS", 3)
 # The participant guide: an earthquake (announced in the bulletin) lowers instrument efficiency, the loss fades
 # night by night, and a report does not repair it. So E drops right after an earthquake are not reportable, and
 # while its effect may last only a new step down in E (a fresh drop from the preceding hours) is fault evidence.
@@ -394,8 +402,14 @@ class ObserverAgent:
             if sum(1 for _, _, e in last4 if e >= E_RECOVER) >= 3 and rows[-1][0] > self.blocked_at_hour:
                 self.episode_blocked = False
                 log(f"pro: quality recovered at {payload['now_utc']}; probing re-armed")
+            elif self._scale_fault(hours):
+                self.episode_blocked = False   # 灾难性低质量是新情况: 允许再探一次
             else:
                 return False
+        if self._scale_fault(hours):
+            log(f"pro: scale {self.planner.scale:.3f} < {SCALE_FAULT_LEVEL} for {SCALE_FAULT_HOURS}h "
+                f"-> instrument fault suspected")
+            return True
         likely = self.fault_likely
         if MODEL_FREE_PROBE and likely is not None and likely >= MODEL_FAULT_HIGH and self.free_left() > 0 and self._scale_step(hours):
             # off by default: on the practice cards it spent free probes on unannounced weather
@@ -431,6 +445,14 @@ class ObserverAgent:
         """The last 3 observed hours all sit below SCALE_STEP x the usual clear-sky scale."""
         recent = [sorted(v)[len(v) // 2] for h, v in sorted(self.scale_hours.items()) if h >= self.ref_from_hours and v][-3:]
         return len(recent) == 3 and max(recent) < SCALE_STEP * self._scale_ref()
+
+    def _scale_fault(self, hours: float) -> bool:
+        """近几小时中位 scale 是否远低于晴夜模型 (绝对判据, 不依赖会塌缩的档位估计)."""
+        recent = [sorted(v)[len(v) // 2] for h, v in sorted(self.scale_hours.items())
+                  if h >= self.ref_from_hours and v][-SCALE_FAULT_HOURS:]
+        return (len(recent) >= SCALE_FAULT_HOURS
+                and float(self.planner.scale) < SCALE_FAULT_LEVEL
+                and max(recent) < SCALE_FAULT_LEVEL)
 
     def _model_agrees(self, hours: float, payload: dict) -> bool:
         """Paid probes only: the model looks at the evidence first and may veto. Free probes cost nothing, so they
