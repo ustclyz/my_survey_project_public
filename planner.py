@@ -80,6 +80,14 @@ CALIB_MIN = 0.30
 CALIB_MAX = 1.20
 CALIB_MIN_SAMPLES = 12
 
+# ---- 仪器故障检测参数 (官方指南 §4: 故障只降 instrument_efficiency, 不影响命中) ----
+# 判据: 近期"实测/预测得分比"的中位数相对长期基准骤降 -> 疑似故障 -> report 修复。
+FAULT_RATIO_DROP = 0.45        # 近期中位数 < 基准 x 此值 即判为故障
+FAULT_RECENT_N = 24            # 近期窗口样本数
+FAULT_BASE_MIN = 40            # 长期基准所需样本数
+FAULT_COOLDOWN_HOURS = 6.0     # 两次 report 的最小间隔 (小时)
+EARTHQUAKE_QUIET_HOURS = 12.0  # 地震公告后多久内不探测 (地震降效率且 report 修不好)
+
 # 必观测视场的"硬优先"权重: 只要视场含 1 个未完成必观测, 其质量就必须压过任何
 # 不含必观测的视场 (含"重试堆"视场, 后者 16x(11+300) ≈ 5000), 否则必观测会被
 # 反复失败的目标挤出局 (实测卡B: 161 个必观测全场可见却一次都没被指派)。
@@ -93,6 +101,9 @@ RETRY_BONUS_MAX_ATTEMPTS = 2
 STALE_PENALTY = 200.0
 # 从未尝试过的可见目标获得加成 (覆盖优先, 防止"只啃硬骨头")。
 FRESH_BONUS = 300.0
+# 已观测过、但**非必观测/非请求**的普通目标: 已有得分, 重拍收益低 -> 抑制。
+# (卡B 实测: 23% 的曝光浪费在普通目标的重复观测上)
+OBSERVED_NONREQ_PENALTY = 150.0
 # 必观测锚定冷却: 刚锚定过的目标让位给其它未完成必观测 (轮转, 避免饿死)。
 ANCHOR_COOLDOWN_DECISIONS = 3
 # 每个目标的尝试次数硬上限: 反复失败后不再参与本轮选择, 把时间让给新鲜目标。
@@ -464,6 +475,17 @@ class Planner:
         self._pred_g: Dict[str, float] = {}
         self._calib_samples: List[float] = []
         self._calib_q: Optional[float] = None
+        # -- 仪器故障检测 (官方指南 §4) ---------------------------------------
+        # 故障只降低 instrument_efficiency, **不影响命中率** —— 只能从"得分异常低"
+        # 发现; `report` 是唯一的修复手段 (报对 +100 并立即修复)。原先我们按命中率
+        # 判故障, 命中率一直 ~99%, 于是**永远不会触发**: 实测卡 A1/C1 的真实质量
+        # 只有正常值的 ~8% (而档位匹配正常) 却一次都没报修, 直接把分数打到 −57k。
+        self._ratio_series: List[float] = []      # 每次命中: 实测得分 / 预测得分
+        self._ratio_hours: List[float] = []       # 对应时刻 (模拟小时)
+        self._fault_suspect = False
+        self._last_report_hours = -1e9
+        self._earthquake_hours = -1e9             # 最近一次地震公告时刻
+        self._hours_now = 0.0
         self._cpu_mark: Optional[float] = None
         self._remaining_cpu: Optional[float] = None   # 本轮的剩余真实 CPU 秒
         self.decision_cpu_total = 0.0
@@ -659,6 +681,9 @@ class Planner:
         self._cpu_mark = cpu
         # 剩余真实 CPU 秒 (供曝光时长的 CPU 预算下限使用)
         self._remaining_cpu = req.remaining_real_cpu_seconds()
+        # 当前模拟小时数 (故障/地震的时间窗判定用)
+        if self.init.start_utc is not None:
+            self._hours_now = max(0.0, (now - self.init.start_utc).total_seconds() / 3600.0)
         self.perf_fill_calls = 0
         self._snapshot = None       # 每轮重新取快照 (同轮内多次调用会命中缓存)
 
@@ -835,6 +860,11 @@ class Planner:
                             ratio = g_upper / pred
                             if 0.05 < ratio < 5.0:
                                 self._calib_samples.append(ratio)
+                                self._ratio_series.append(ratio)
+                                self._ratio_hours.append(self._hours_now)
+                                if len(self._ratio_series) > 400:
+                                    del self._ratio_series[:200]
+                                    del self._ratio_hours[:200]
                                 if len(self._calib_samples) > 200:
                                     del self._calib_samples[:100]
                                 if len(self._calib_samples) >= CALIB_MIN_SAMPLES:
@@ -848,6 +878,12 @@ class Planner:
             correct = bool(lr.get("correct"))
             self.log(f"planner: report 结果 correct={correct} delta={lr.get('score_delta')}")
             self.consecutive_reports = 1 if correct else self.consecutive_reports
+            if correct:
+                # 故障已修复: 质量估计重新开始 (官方指南: 正确举报立即修复)
+                self._ratio_series.clear()
+                self._ratio_hours.clear()
+                self._calib_samples.clear()
+                self._calib_q = None
 
     def _update_pace(self, req) -> None:
         """按剩余 CPU 预算与剩余决策量选择计算档位 (预算保护).
@@ -983,21 +1019,61 @@ class Planner:
         return self.consecutive_reports < self.init.max_consecutive_reports
 
     def _maybe_report(self, state: DecisionState) -> Optional[Action]:
-        """启发式故障判据 + LLM 提示.
+        """仪器故障判据 (官方指南 §4): 故障只降 instrument_efficiency, **不影响命中率**.
 
-        只有当 (a) LLM 明确建议 report, 或 (b) 近期命中率极低且未报过太少次 时才报告.
-        误报会扣分, 故保守: 默认不报, 除非证据充分.
+        判据: 近期"实测得分/预测得分"的中位数相对长期基准骤降 (FAULT_RATIO_DROP)。
+        这一条替代了原先的"命中率过低"判据 —— 后者永远不会触发 (命中率一直 ~99%),
+        导致真实故障从未被修复 (实测卡 A1/C1 的真实质量只有正常值的 ~8% 却一次没报)。
+
+        保护措施:
+            * **地震**: 地震只降效率且 report 修不好 -> 公告后 EARTHQUAKE_QUIET_HOURS
+              内一律不探测;
+            * 两次 report 之间有冷却, 且总次数有上限, 避免把免费/付费额度耗光;
+            * LLM 明确建议 report 时也采纳 (但同样受上述保护约束)。
         """
         if not self._can_report():
             return None
-        if self.reports_made >= 2:
+        if self.reports_made >= 6:
             return None
-        rate = state.last_hit_rate
-        strong = rate is not None and rate <= 0.15 and self.assigned_total >= 48
-        if self.report_fault_hint or strong:
+        # 地震公告: 记录时刻并静默 (report 修不好地震造成的效率损失, 报了就是误报)
+        for n in (state.notices or []):
+            if isinstance(n, dict) and n.get("event_kind") == "earthquake":
+                if self._hours_now - self._earthquake_hours > 1.0:
+                    self.log(f"planner: 收到地震公告 (t={self._hours_now:.1f}h), 暂停故障探测")
+                self._earthquake_hours = self._hours_now
+        if self._hours_now - self._earthquake_hours < EARTHQUAKE_QUIET_HOURS:
+            return None
+        if self._hours_now - self._last_report_hours < FAULT_COOLDOWN_HOURS:
+            return None
+        if self._fault_suspect or self.report_fault_hint or self._fault_detected():
             self.report_fault_hint = False
-            return self._make_report(f"命中率异常低 ({rate})")
+            self._fault_suspect = False
+            self._last_report_hours = self._hours_now
+            return self._make_report("得分质量骤降 (疑似仪器故障)")
         return None
+
+    def _fault_detected(self) -> bool:
+        """近期"实测/预测得分比"的中位数是否相对长期基准骤降 (疑似仪器故障)."""
+        n = len(self._ratio_series)
+        if n < FAULT_BASE_MIN + 4:
+            return False
+        recent = self._ratio_series[-FAULT_RECENT_N:]
+        base = self._ratio_series[:-FAULT_RECENT_N]
+        if len(base) < FAULT_BASE_MIN:
+            return False
+        def _median(xs):
+            s = sorted(xs)
+            return s[len(s) // 2]
+        base_med = _median(base)
+        recent_med = _median(recent)
+        if base_med <= 1e-9:
+            return False
+        drop = recent_med / base_med
+        if drop < FAULT_RATIO_DROP:
+            self.log(f"planner: 质量骤降 {drop:.2f}x (近期 {recent_med:.3f} / 基准 {base_med:.3f})"
+                     f" -> 疑似仪器故障")
+            return True
+        return False
 
     def _make_report(self, reason: str) -> Action:
         self.reports_made += 1
@@ -1096,12 +1172,20 @@ class Planner:
         observed = self.observed_ids
         attempted = self.attempted_ids
         required_ids = self._required_ids
+        # 只有"必观测"和"限时请求"目标才值得重试: 它们有明确的达标门槛/奖励;
+        # 普通目标只要拍过一次就已有得分, 重拍远不如去拍一个从未拍过的目标。
+        # (平台实测卡B: 42,574 次曝光里 9,948 次是重复, 其中 8,435 次是普通目标 ——
+        #  白白浪费了 23% 的观测机会, 直接压低覆盖面)
+        must_ids = required_ids | self._active_request_targets(requests, self._now_utc)
         for t in visible:
             tid = t.target_id
             if tid in observed:
                 g_upper = self.achieved_g.get(tid)
                 if g_upper is not None and g_upper >= threshold:
                     priorities[tid] -= 5000.0
+                elif tid not in must_ids:
+                    # 普通目标已观测过: 不再重试, 让位给从未拍过的目标
+                    priorities[tid] -= OBSERVED_NONREQ_PENALTY
                 else:
                     # 未达标: 只在前 RETRY_BONUS_MAX_ATTEMPTS 次给重试加成,
                     # 之后转为抑制 —— 否则"失败目标堆"会永久压过新鲜目标。
@@ -1176,6 +1260,34 @@ class Planner:
         if boosted:
             self.log(f"planner: 限时请求目标加成 {len(boosted)} 个")
         return boosted
+
+    def _active_request_targets(self, requests, now) -> set:
+        """当前"未完成且未过期"的限时观测请求所涉及的目标集合."""
+        out: set = set()
+        for r in (requests or []):
+            if not isinstance(r, dict):
+                continue
+            tids = [str(t) for t in (r.get("target_ids") or [])]
+            if not tids:
+                continue
+            done = {str(t) for t in (r.get("completed_target_ids") or [])}
+            remaining = r.get("remaining_count")
+            try:
+                remaining = int(remaining) if remaining is not None else None
+            except (TypeError, ValueError):
+                remaining = None
+            if remaining is None:
+                try:
+                    remaining = max(0, int(r.get("minimum_completed") or 0) - len(done))
+                except (TypeError, ValueError):
+                    remaining = 0
+            if remaining <= 0:
+                continue
+            deadline = _parse_utc(r.get("deadline_utc"))
+            if deadline is not None and now is not None and deadline <= now:
+                continue
+            out.update(t for t in tids if t not in done)
+        return out
 
     def _visible(self, t: Target, lst: float) -> bool:
         """单个目标是否可见 (阈值 = minimum_altitude + 安全余量).

@@ -492,6 +492,51 @@ def test_continuity_seed_centers_are_near_previous_pointing():
 
 
 # ---------------------------------------------------------------------------
+# 仪器故障检测 (官方指南 §4: 故障只降 instrument_efficiency, 不影响命中率)
+# ---------------------------------------------------------------------------
+
+
+def test_fault_detector_triggers_on_quality_collapse():
+    """质量骤降必须被识别为疑似故障 (命中率不变, 所以旧判据永远不会触发)."""
+    p, _ = _make_planner_with_card("alpha")
+    p._ratio_series = [1.0] * 100
+    p._ratio_hours = [float(i) for i in range(100)]
+    assert not p._fault_detected(), "稳定期不应误判故障"
+
+    # 故障: 实测/预测得分比掉到 0.1 (≈ instrument_efficiency 被打到 10%)
+    p._ratio_series[-planner_mod.FAULT_RECENT_N:] = [0.1] * planner_mod.FAULT_RECENT_N
+    assert p._fault_detected(), "质量骤降应判为故障"
+
+
+def test_fault_report_is_suppressed_after_earthquake():
+    """地震公告后不得探测: 地震只降效率且 report 修不好, 报了就是误报."""
+    p, _ = _make_planner_with_card("alpha")
+    p._ratio_series = [1.0] * 100 + [0.1] * planner_mod.FAULT_RECENT_N
+    p._ratio_hours = [float(i) for i in range(len(p._ratio_series))]
+    p._hours_now = 200.0
+    p._earthquake_hours = 195.0        # 5 小时前刚有地震公告
+
+    quake = DecisionState(notices=[{"event_kind": "earthquake", "direction": "ALL"}])
+    assert p._maybe_report(quake) is None, "地震后的静默期内不应 report"
+
+    p._earthquake_hours = -1e9         # 静默期结束
+    act = p._maybe_report(DecisionState(notices=[]))
+    assert act is not None and act.type == "report", "静默期结束后应报告疑似故障"
+
+
+def test_correct_report_resets_quality_baseline():
+    """正确举报修复故障后, 质量基准要清零重算 (否则会立刻再次误判)."""
+    p, _ = _make_planner_with_card("alpha")
+    p._ratio_series = [0.1] * 50
+    p._calib_samples = [0.1] * 20
+    p._calib_q = 0.1
+    req = type("R", (), {"last_result": {"action": "report", "correct": True, "repaired": True,
+                                         "score_delta": 100.0}})()
+    p._update_result(req)
+    assert p._ratio_series == [] and p._calib_samples == [] and p._calib_q is None
+
+
+# ---------------------------------------------------------------------------
 # 关键几何正确性 + 必观测保障 (本轮新增)
 # ---------------------------------------------------------------------------
 
