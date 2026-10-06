@@ -812,3 +812,169 @@ def test_decide_does_not_idle_all_night_for_forecast_rain():
     )
     action = p.decide(req)
     assert "全天天雨/暴风" not in (action.reason or ""), "预报不得触发整夜关闭"
+
+
+# ---------------------------------------------------------------------------
+# 性能结构 (skyindex / 每轮只算一次) 回归
+# ---------------------------------------------------------------------------
+
+
+def test_skyindex_visibility_matches_altitude_rule():
+    """TargetIndex 的时角判据必须与 alt >= 阈值 严格等价 (提速的核心前提)."""
+    import math as _math
+    import random
+
+    import skyindex
+
+    card = _load_card("alpha")
+    targets = planner_mod.Target.from_preplan
+    subset = [targets(t) for t in card.targets[:400]]
+    lat = card.fiber_config["site"]["latitude_deg"]
+    min_alt = 30.0 + planner_mod.ALT_MARGIN_DEG
+    idx = skyindex.TargetIndex(subset, lat, min_alt)
+
+    rng = random.Random(20261006)
+    mismatches = 0
+    for _ in range(300):
+        lst = rng.uniform(0.0, 360.0)
+        mask = set(idx.visible_indices(lst))
+        for i, t in enumerate(subset):
+            alt, _az = planner_mod.radec_to_altaz(t.ra_deg, t.dec_deg, lst, lat)
+            if (alt >= min_alt) != (i in mask):
+                mismatches += 1
+    assert mismatches == 0, f"时角判据与高度角判据不一致 {mismatches} 次"
+
+
+def test_skyindex_altaz_matches_radec_to_altaz():
+    """TargetIndex 的批量 alt/az 必须与 radec_to_altaz 一致."""
+    import skyindex
+
+    card = _load_card("alpha")
+    subset = [planner_mod.Target.from_preplan(t) for t in card.targets[:200]]
+    lat = card.fiber_config["site"]["latitude_deg"]
+    idx = skyindex.TargetIndex(subset, lat, 30.0)
+
+    lst = 137.25
+    indices = list(range(len(subset)))
+    pairs = idx.altaz_pairs(indices, lst)
+    for i, (alt, az) in enumerate(pairs):
+        ref_alt, ref_az = planner_mod.radec_to_altaz(subset[i].ra_deg, subset[i].dec_deg, lst, lat)
+        assert abs(alt - ref_alt) < 1e-9
+        assert abs(((az - ref_az + 180.0) % 360.0) - 180.0) < 1e-9
+
+
+def _run_n_observes(p, nights, n=6):
+    """驱动 planner 走 n 次观测决策 (白天/等待自动跳过), 返回观测次数."""
+    from datetime import timedelta
+    from protocol import DecisionRequest
+
+    now = datetime.fromisoformat(nights[0]["observing_start_utc"].replace("Z", "+00:00")).astimezone(timezone.utc)
+    end = datetime.fromisoformat(nights[-1]["observing_end_utc"].replace("Z", "+00:00")).astimezone(timezone.utc)
+    last = None
+    seq = 0
+    observed = 0
+    while observed < n and now < end and seq < 200:
+        seq += 1
+        req = DecisionRequest({
+            "decision_sequence": seq,
+            "payload": {"now_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "survey_end_utc": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "wallclock": {"remaining_seconds": 900, "remaining_real_cpu_seconds": 900,
+                                      "wall_remaining_seconds": 1800},
+                        "latest_bulletin": {"notices": []}, "active_requests": [],
+                        "new_messages": [], "last_result": last},
+        })
+        act = p.decide(req)
+        if act.type == "observe":
+            observed += 1
+            now += timedelta(seconds=act.exposure_seconds or 900)
+            tids = list(act.assignments.values())
+            last = {"action": "observe", "assigned_count": len(tids), "hit_count": len(tids),
+                    "hits": [{"target_id": t} for t in tids]}
+        elif act.type == "wait":
+            now += timedelta(seconds=act.duration_seconds or 900)
+            last = {"action": "wait"}
+        else:
+            break
+    return observed
+
+
+def test_decide_makes_one_visibility_pass_and_caches_priorities(monkeypatch):
+    """每轮决策只应做一次全量可见性扫描, 且优先级只算一次 (不随轮次重算)."""
+    import skyindex
+    import preplan as preplan_mod
+
+    counts = {"visible": 0, "priorities": 0}
+    orig_visible = skyindex.TargetIndex.visible_indices
+
+    def counted_visible(self, lst):
+        counts["visible"] += 1
+        return orig_visible(self, lst)
+
+    monkeypatch.setattr(skyindex.TargetIndex, "visible_indices", counted_visible)
+    orig_prio = preplan_mod.compute_priorities
+
+    def counted_prio(card):
+        counts["priorities"] += 1
+        return orig_prio(card)
+
+    monkeypatch.setattr(preplan_mod, "compute_priorities", counted_prio)
+
+    p, nights = _make_planner_with_card("alpha")
+    observed = _run_n_observes(p, nights, n=6)
+    assert observed >= 3, "应至少产出几次观测"
+    # 优先级: 首次之后命中缓存, 不应随轮次增长
+    assert counts["priorities"] == 1, f"优先级应只算一次 (实际 {counts['priorities']})"
+    # 可见性: 每轮至多一次 (允许白天等待轮多算一次, 因此用轮数上界)
+    assert counts["visible"] <= observed + 2, f"可见性扫描次数过多 ({counts['visible']})"
+
+
+def test_nights_are_preparsed(monkeypatch):
+    """夜间起止时间应预解析一次, decide() 期间不再反复解析 ISO 串."""
+    counts = {"parse": 0}
+    orig_parse = planner_mod._parse_utc
+
+    def counted(value):
+        counts["parse"] += 1
+        return orig_parse(value)
+
+    monkeypatch.setattr(planner_mod, "_parse_utc", counted)
+    p, nights = _make_planner_with_card("alpha")     # 预解析发生在这里
+    before = counts["parse"]
+    _run_n_observes(p, nights, n=6)
+    assert counts["parse"] == before, f"decide() 期间不应再解析夜历 (新增 {counts['parse'] - before} 次)"
+
+
+def test_request_targets_get_priority_bonus():
+    """未完成且未过期的限时观测请求目标应获得显式优先级加成."""
+    from datetime import timedelta
+
+    p, nights = _make_planner_with_card("alpha")
+    n = nights[0]
+    now = datetime.fromisoformat(n["observing_start_utc"].replace("Z", "+00:00")).astimezone(timezone.utc)
+    p._now_utc = now        # 与 decide() 中的行为一致 (请求加成依赖"当前时刻")
+    visible = p.targets.targets[:5]
+    tid = visible[0].target_id
+    deadline = (now + timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    late = (now - timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    base = p._all_priorities()
+    # 未过期 -> 加成
+    reqs = [{"request_id": "R1", "target_ids": [tid], "minimum_completed": 1,
+             "completed_count": 0, "completed_target_ids": [], "deadline_utc": deadline}]
+    _, priorities, boosted = p._prepare_round(visible, reqs)
+    assert tid in boosted
+    assert priorities[tid] > base.get(tid, 0.0) + 100.0
+
+    # 已过截止 -> 不加成
+    reqs_late = [{"request_id": "R2", "target_ids": [tid], "minimum_completed": 1,
+                  "completed_count": 0, "completed_target_ids": [], "deadline_utc": late}]
+    _, priorities2, boosted2 = p._prepare_round(visible, reqs_late)
+    assert boosted2 == set()
+    assert priorities2[tid] <= base.get(tid, 0.0) + 100.0
+
+    # 已达标 -> 不加成
+    reqs_done = [{"request_id": "R3", "target_ids": [tid], "minimum_completed": 1,
+                  "completed_count": 1, "completed_target_ids": [tid], "deadline_utc": deadline}]
+    _, _, boosted3 = p._prepare_round(visible, reqs_done)
+    assert boosted3 == set()

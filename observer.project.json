@@ -2,10 +2,13 @@
   "schema_version": "observer-project-v1",
   "protocol": "jsonl-v4",
   "image": "python:3.12-slim",
-  "build": [],
+  "build": [
+    ["pip", "install", "--no-cache-dir", "--target", ".deps", "-r", "requirements.txt"]
+  ],
   "run": ["python3", "-u", "agent.py"],
   "working_directory": ".",
   "environment": {
-    "PYTHONDONTWRITEBYTECODE": "1"
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONPATH": "/workspace/.deps"
   }
 }

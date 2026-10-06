@@ -29,6 +29,8 @@
 from __future__ import annotations
 
 import math
+import time
+import heapq
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -36,6 +38,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import preplan
 from models import Action, DecisionState, NightPlan, Target
 from protocol import log
+from skyindex import HAVE_NUMPY, TargetIndex
 
 # ---------------------------------------------------------------------------
 # 天文几何 (标准公式, 与官方示例一致)
@@ -47,6 +50,21 @@ ALT_MARGIN_DEG = 1.0  # 规划时目标需高于最低高度角的安全余量
 # 曝光时长估算使用的"典型 seeing"参考值 (官方隐藏真值不可知). 取偏保守 (较大) 的
 # 值, 使必观测目标的完成曝光偏长, 从而在常见/偏差天气下更稳地达到完成因子 0.5.
 SEEING_REF_FOR_SCORING = 1.1
+
+# ---------------------------------------------------------------------------
+# 性能预算调参 (只影响"每轮算多少", 不改变动作合法性)
+# ---------------------------------------------------------------------------
+# 背景: 每轮决策原本要对全部 N 个目标重算可见性/优先级, 并评估 ~192 个候选
+# 视场中心; 在 3 万目标 x 数千轮决策的规模下会吃光 900s CPU 预算。下面这些
+# 上限把"每轮成本"与卡规模解耦 (本机实测卡 A 单决策 ~500ms -> 目标 <150ms)。
+MAX_CENTERS_PER_DECISION = 64     # 每轮候选视场中心的硬上限
+PROBE_MAX = 60                    # 稠密探测阶段最多评估的锚点数
+FINE_FIBER_MAX = 16               # 精细搜索时每个锚点采样的光纤中心数
+MAX_REFINE_CENTERS = 32           # 精细搜索阶段最多评估的中心数 (须给后续阶段留额度)
+MAX_REQUIRED_ANCHOR_CENTERS = 12  # 必观测锚定每轮最多生成的候选中心数
+MAX_CONTINUITY_CENTERS = 8        # 连续性种子每轮最多生成的候选中心数
+REQUEST_BONUS = 800.0             # 限时观测请求目标的优先级加成
+REQUEST_BONUS_URGENT = 1200.0     # 距截止不足 1 夜时的加成
 
 
 def _julian_date(moment: datetime) -> float:
@@ -369,6 +387,35 @@ class Planner:
         self._fiber_grid = self._build_grid()
         self._priorities_all: Optional[Dict[str, float]] = None  # 全体目标优先级缓存
 
+        # -- 每轮共享的预计算 (性能关键) --------------------------------------
+        # 夜间起止时间: 原本每轮都要对全部夜重新做 ISO 解析 (卡 D 每轮 1800+ 次),
+        # 这里一次性解析好; 索引与 init.nights 一一对应 (解析失败处为 None)。
+        self._nights: List[Tuple[Optional[datetime], Optional[datetime]]] = [
+            (_parse_utc(n.get("observing_start_utc")), _parse_utc(n.get("observing_end_utc")))
+            for n in self.init.nights
+        ]
+        # 目标可见性/地平坐标索引: 一次性算好 h_max 等, 之后每轮只做数组比较。
+        self._sky = TargetIndex(self.targets.targets, self.lat, self.min_alt + ALT_MARGIN_DEG)
+        # 每轮只算一次的可见性快照 (供 _build_state 与 _plan_observe 复用)
+        self._snapshot: Optional[Tuple[float, List[Target], Dict[str, Tuple[float, float]]]] = None
+        # 必观测集合/达标阈值: 与时间无关, 预计算一次 (原实现每轮重建一个数万条的集合)
+        self._required_ids = {t.target_id for t in self.targets.targets if t.required}
+        try:
+            self._required_threshold = float(
+                (init_data.scoring or {}).get("required", {}).get("observed_factor_threshold", 0.5)
+            )
+        except (AttributeError, TypeError, ValueError):
+            self._required_threshold = 0.5
+        if self._required_threshold <= 0.0:
+            self._required_threshold = 0.5
+
+        # -- 性能计数 (只写 stderr 日志 / 本地预算仿真, 不影响决策) -------------
+        self.perf_fill_calls = 0      # 本轮 _fill_pointing 调用次数
+        self.perf_visible_n = 0       # 本轮可见目标数
+        self._cpu_mark: Optional[float] = None
+        self.decision_cpu_total = 0.0
+        self.decision_cpu_count = 0
+
         # -- 观测记忆: 已观测/已得分目标 (避免重复曝光同一视场) --------------
         # 规则: 每个目标只算它最好的一次曝光, 多次曝光不累加 (规则 5.4).
         self.observed_ids: set = set()          # 已成功得分的目标 ID
@@ -544,6 +591,15 @@ class Planner:
             return Action(type="wait", duration_seconds=900, reason="无 now_utc", decision_source="fallback")
         self._now_utc = now
 
+        # -- 性能计数: 两次 decide 之间的 CPU 时间 ≈ 上一轮的成本 -------------
+        cpu = time.process_time()
+        if self._cpu_mark is not None:
+            self.decision_cpu_total += cpu - self._cpu_mark
+            self.decision_cpu_count += 1
+        self._cpu_mark = cpu
+        self.perf_fill_calls = 0
+        self._snapshot = None       # 每轮重新取快照 (同轮内多次调用会命中缓存)
+
         self._update_result(req)
         # 预算档位提前计算: 供后续等待动作做预算自适应 (跳过空转 slot).
         self._update_pace(req)
@@ -574,7 +630,18 @@ class Planner:
             self._empty_waits_in_night = 0
 
         self.decisions_seen += 1
-        state = self._build_state(req, night_index, night_start, night_end, is_new_night)
+        # 每轮只算一次"可见目标 + 地平坐标"(供 _build_state 与 _plan_observe 复用)
+        lst = local_sidereal_deg(now, self.lon)
+        visible, altaz = self._snapshot_sky(lst)
+        # 每轮只算一次有效优先级与排序 (含所有加成)
+        ranked, priorities, request_targets = self._prepare_round(visible, req.active_requests)
+        state = self._build_state(req, night_index, night_start, night_end, is_new_night,
+                                  lst=lst, visible=visible,
+                                  candidates=[t.target_id for t in ranked[:96]])
+        if self.decision_cpu_count and self.decision_cpu_count % 200 == 0:
+            avg_ms = self.decision_cpu_total / self.decision_cpu_count * 1000.0
+            self.log(f"planner: CPU 平均 {avg_ms:.0f} ms/决策 (已 {self.decision_cpu_count} 轮); "
+                     f"本轮可见 {len(visible)} 目标, 视场中心评估 {self.perf_fill_calls} 次, pace={self.pace_level}")
 
         # 环节A·任务规划: 仅在新夜 (关键决策点) 调用
         if is_new_night or self.night_plan is None:
@@ -626,7 +693,10 @@ class Planner:
             return self._wait_action(now, night_start, night_end, llm_action.reason)
 
         # 落成 observe (LLM 意向或纯静态)
-        action = self._plan_observe(now, night_end, night_index, state)
+        action = self._plan_observe(now, night_end, night_index, state,
+                                    lst=lst, visible=visible, altaz=altaz,
+                                    ranked=ranked, priorities=priorities,
+                                    request_targets=request_targets)
         if action is None:
             return self._wait_action(now, night_start, night_end, "暂无可观测目标")
         return action
@@ -716,9 +786,7 @@ class Planner:
         # 估算剩余 decision 数
         decisions_left = 1.0
         if req.now_utc is not None:
-            for n in self.init.nights:
-                end = _parse_utc(n.get("observing_end_utc"))
-                start = _parse_utc(n.get("observing_start_utc"))
+            for start, end in self._nights:
                 if end and end > req.now_utc:
                     eff_start = max(start, req.now_utc) if start else req.now_utc
                     decisions_left += max(0.0, (end - eff_start).total_seconds()) / 700.0
@@ -743,17 +811,14 @@ class Planner:
             self.llm_decide_interval = max(1, min(interval, 20))
 
     def _current_night(self, now):
-        for idx, n in enumerate(self.init.nights):
-            start = _parse_utc(n.get("observing_start_utc"))
-            end = _parse_utc(n.get("observing_end_utc"))
+        for idx, (start, end) in enumerate(self._nights):
             if start and end and start <= now < end:
                 return idx, start, end
         return None
 
     def _next_night_start(self, now):
         best = None
-        for n in self.init.nights:
-            start = _parse_utc(n.get("observing_start_utc"))
+        for start, _end in self._nights:
             if start and start > now and (best is None or start < best):
                 best = start
         return best
@@ -866,15 +931,19 @@ class Planner:
         return Action(type="report", reason=reason, decision_source=source)
 
     # -- 构建 DecisionState ------------------------------------------------
-    def _build_state(self, req, night_index, night_start, night_end, is_new_night) -> DecisionState:
+    def _build_state(self, req, night_index, night_start, night_end, is_new_night,
+                     lst: Optional[float] = None,
+                     visible: Optional[Sequence[Target]] = None,
+                     candidates: Optional[List[str]] = None) -> DecisionState:
         now = req.now_utc
-        lst = local_sidereal_deg(now, self.lon)
-        # 候选: 优先级排序 + 可见性过滤, 限制数量
-        candidates = self._visible_candidates(lst, now)
-        required_remaining = sum(
-            1 for t in self.targets.targets
-            if t.required and self._visible(t, lst)
-        )
+        if lst is None:
+            lst = local_sidereal_deg(now, self.lon)
+        if visible is None:
+            visible, _ = self._snapshot_sky(lst)
+        # 候选: 由 _prepare_round 的排序结果直接截取 (避免重复排序); 缺省回退到现算。
+        if candidates is None:
+            candidates = self._visible_candidates(lst, now, visible=visible)
+        required_remaining = sum(1 for t in visible if t.required)
         hit_rate = (self.hits_total / self.assigned_total) if self.assigned_total > 0 else None
 
         # 异常判定: 上次观测有指派但命中率很低
@@ -917,34 +986,176 @@ class Planner:
             last_hit_rate=hit_rate,
         )
 
-    def _visible(self, t: Target, lst: float) -> bool:
-        alt, _ = radec_to_altaz(t.ra_deg, t.dec_deg, lst, self.lat)
-        return alt >= self.min_alt + ALT_MARGIN_DEG
+    def _prepare_round(self, visible: Sequence[Target], requests):
+        """一轮只算一次: 有效优先级 + 排序 + 未完成必观测集合.
 
-    def _visible_candidates(self, lst: float, now: datetime, limit: int = 96) -> List[str]:
-        """可见目标按 preplan 优先级排序, 返回前 limit 个 ID."""
-        visible = [t for t in self.targets.targets if self._visible(t, lst)]
+        原实现同一轮里会 (1) 在 ``_build_state`` 对可见集排序取前 96; (2) 在
+        ``_plan_observe`` 再排一次; (3) 复制一份 3~5 万条的全局优先级字典; (4) 每轮
+        重建 ``required_ids`` 集合。这里统一成一次 O(可见数) 的计算。
+
+        Returns:
+            ``(ranked, priorities, request_targets)`` —— ``ranked`` 为按有效优先级
+            降序的可见目标; ``request_targets`` 为本轮获得请求加成的目标集合。
+        """
+        base = self._all_priorities()
+        priorities: Dict[str, float] = {t.target_id: base.get(t.target_id, 0.0) for t in visible}
+
+        # 本夜规划目标的加成 (LLM/静态策略的落点)
+        if self.night_plan is not None:
+            for tid in self.night_plan.targets:
+                if tid in priorities:
+                    priorities[tid] += 500.0
+
+        # 观测记忆: 已达标 -> 强惩罚 (不再重复); 未达标 -> 重试加成;
+        # 试过但没命中且非必观测 -> 轻微回避。按"可见集"迭代, 成本与可见数同阶,
+        # 不随巡天推进而无限增长 (旧实现遍历的是全局 observed/attempted 集合)。
+        threshold = self._required_threshold
+        observed = self.observed_ids
+        attempted = self.attempted_ids
+        required_ids = self._required_ids
+        for t in visible:
+            tid = t.target_id
+            if tid in observed:
+                g_upper = self.achieved_g.get(tid)
+                if g_upper is not None and g_upper >= threshold:
+                    priorities[tid] -= 5000.0
+                else:
+                    priorities[tid] += 300.0
+            elif tid in attempted and tid not in required_ids:
+                priorities[tid] -= 100.0
+
+        # 限时观测请求目标加成
+        request_targets = self._boost_request_targets(requests, priorities, self._now_utc)
+
+        # 未完成必观测集合 (供视场加成与必观测锚定使用)
+        unfinished = set()
+        for tid in required_ids:
+            g_upper = self.achieved_g.get(tid)
+            if g_upper is None:
+                if tid not in observed:
+                    unfinished.add(tid)
+            elif g_upper < threshold:
+                unfinished.add(tid)
+        self._required_unfinished = unfinished
+
+        ranked = sorted(visible, key=lambda t: priorities.get(t.target_id, 0.0), reverse=True)
+        return ranked, priorities, request_targets
+
+    def _boost_request_targets(self, requests, priorities: Dict[str, float],
+                               now: datetime) -> set:
+        """给"未完成且未过期"的限时观测请求目标加优先级, 返回被加成的目标集合.
+
+        常规 +800; 距 deadline 不足 1 夜 +1200。已完成的目标跳过, 已过截止的
+        请求整条跳过 (规则: 只有发布到截止之间的曝光才计入)。被加成的目标还会
+        在 :meth:`_choose_duration` 里按"完成因子 0.5"给足曝光 —— 奖励按完成
+        因子判定且不含程序加成, 光靠排序加成拿不到分。
+        """
+        boosted: set = set()
+        for r in (requests or []):
+            if not isinstance(r, dict):
+                continue
+            tids = [str(t) for t in (r.get("target_ids") or [])]
+            if not tids:
+                continue
+            done = {str(t) for t in (r.get("completed_target_ids") or [])}
+            remaining = r.get("remaining_count")
+            try:
+                remaining = int(remaining) if remaining is not None else None
+            except (TypeError, ValueError):
+                remaining = None
+            if remaining is None:
+                try:
+                    remaining = max(0, int(r.get("minimum_completed") or 0) - len(done))
+                except (TypeError, ValueError):
+                    remaining = 0
+            if remaining <= 0:
+                continue                       # 已达标: 不必再抢
+            deadline = _parse_utc(r.get("deadline_utc"))
+            if deadline is not None and now is not None and deadline <= now:
+                continue                       # 已过截止: 再观测也不计入
+            bonus = REQUEST_BONUS
+            if (deadline is not None and now is not None
+                    and (deadline - now).total_seconds() <= 86400.0):
+                bonus = REQUEST_BONUS_URGENT
+            for tid in tids:
+                if tid in done or tid not in priorities:
+                    continue                    # 不可见/已完成: 跳过
+                priorities[tid] += bonus
+                boosted.add(tid)
+        if boosted:
+            self.log(f"planner: 限时请求目标加成 {len(boosted)} 个")
+        return boosted
+
+    def _visible(self, t: Target, lst: float) -> bool:
+        """单个目标是否可见 (阈值 = minimum_altitude + 安全余量).
+
+        走 :class:`skyindex.TargetIndex` 的时角判据 (与 alt 判据严格等价, 无三角函数)。
+        """
+        i = self._sky.pos.get(t.target_id)
+        if i is None:  # 未进索引 (异常情况): 回退到直接计算
+            alt, _ = radec_to_altaz(t.ra_deg, t.dec_deg, lst, self.lat)
+            return alt >= self.min_alt + ALT_MARGIN_DEG
+        return self._sky.is_visible_index(i, lst)
+
+    def _snapshot_sky(self, lst: float):
+        """一轮只算一次的"可见目标 + 地平坐标"快照.
+
+        原本同一轮里 ``_build_state``(候选/必观测统计) 与 ``_plan_observe`` 会各自
+        把全部目标扫一遍 (卡 A 实测每轮约 6 万次可见性判断)。这里统一成一次,
+        并顺手得到 alt/az 供光纤填充复用。返回 ``(visible_targets, altaz_map)``。
+        """
+        cached = self._snapshot
+        if cached is not None and cached[0] == lst:
+            return cached[1], cached[2]
+        idx = self._sky.visible_indices(lst)
+        targets = self.targets.targets
+        visible = [targets[i] for i in idx]
+        altaz = self._sky.altaz_map(idx, lst)
+        self._snapshot = (lst, visible, altaz)
+        self.perf_visible_n = len(visible)
+        return visible, altaz
+
+    def _all_priorities(self) -> Dict[str, float]:
+        """全体目标的优先级 (只算一次并缓存; 与夜/时间无关).
+
+        原实现的缓存在调用方传入"可见子集"时永不命中, 于是每轮重算两次
+        (卡 A 实测 ~76 ms/轮)。这里改为始终基于**全体目标**计算一次 ——
+        均匀度按全量归一化 (有意变更), 且优先级跨轮稳定。
+        """
+        if self._priorities_all is None:
+            card = self.tool._temp_card(self.targets.targets)
+            self._priorities_all = preplan.compute_priorities(card)
+        return self._priorities_all
+
+    def _visible_candidates(self, lst: float, now: datetime, limit: int = 96,
+                            visible: Optional[Sequence[Target]] = None) -> List[str]:
+        """可见目标按优先级排序, 返回前 limit 个 ID (可复用已算好的可见集)."""
+        if visible is None:
+            visible, _ = self._snapshot_sky(lst)
         if not visible:
             return []
-        priorities = self._priorities_for(visible)
+        priorities = self._all_priorities()
         ranked = sorted(visible, key=lambda t: priorities.get(t.target_id, 0.0), reverse=True)
         return [t.target_id for t in ranked[:limit]]
 
     def _priorities_for(self, targets: Sequence[Target]) -> Dict[str, float]:
-        """调用 preplan 计算优先级 (复用, 不重写).
+        """按给定目标集计算优先级 (保留给需要"子集口径"的调用方).
 
-        若目标是全体目标, 则缓存结果 (优先级只依赖目标集合, 不随夜变化).
+        决策主路径请用 :meth:`_all_priorities` (全量缓存, 每轮零成本)。
         """
         if len(targets) == len(self.targets.targets):
-            if self._priorities_all is None:
-                card = self.tool._temp_card(targets)
-                self._priorities_all = preplan.compute_priorities(card)
-            return self._priorities_all
+            return self._all_priorities()
         card = self.tool._temp_card(targets)
         return preplan.compute_priorities(card)
 
     # -- observe 规划 ------------------------------------------------------
-    def _plan_observe(self, now, night_end, night_index, state: DecisionState) -> Optional[Action]:
+    def _plan_observe(self, now, night_end, night_index, state: DecisionState,
+                      lst: Optional[float] = None,
+                      visible: Optional[Sequence[Target]] = None,
+                      altaz: Optional[Dict[str, Tuple[float, float]]] = None,
+                      ranked: Optional[List[Target]] = None,
+                      priorities: Optional[Dict[str, float]] = None,
+                      request_targets: Optional[set] = None) -> Optional[Action]:
         """把候选目标集落成一个合法的 observe 动作.
 
         方法 (复用 preplan 的优先级与 FiberGrid 方格模型, 但不使用其多次指向的
@@ -956,70 +1167,32 @@ class Planner:
                (每根至多一个目标, 且目标需高于最低高度角);
             4. 选总优先级最高的中心作为最终指向, 并选择曝光时长与 program.
         """
-        lst = local_sidereal_deg(now, self.lon)
+        if lst is None:
+            lst = local_sidereal_deg(now, self.lon)
         seconds_left = (night_end - now).total_seconds()
         if seconds_left < self.min_exposure:
             return None
 
-        # 填充用: 全部可见目标 (尽可能填满 16 根光纤); 优先级只在可见集内计算一次.
-        visible = [t for t in self.targets.targets if self._visible(t, lst)]
+        # 填充用: 全部可见目标 (尽可能填满光纤)。可见集与 alt/az 由本轮快照一次算好,
+        # 不再在这里对全部目标重扫一遍 (原实现每轮多扫 ~3 万次)。
+        if visible is None or altaz is None:
+            visible, altaz = self._snapshot_sky(lst)
         if not visible:
             return None
-        # 本夜规划目标作为优先级加成 (LLM/静态策略的落点)
-        wanted = set(tid for tid in (self.night_plan.targets if self.night_plan else []) if tid in self.targets.index)
-        # 重要: 复制一份再修改. _priorities_for 在全体目标时会返回**缓存引用**,
-        # 若直接就地修改会跨轮累积并污染缓存 (导致结果抖动/漂移). [已修复]
-        priorities = dict(self._priorities_for(visible))
-        for tid in wanted:
-            if tid in priorities:
-                priorities[tid] += 500.0  # 计划优先目标获得显著加成
-        # 观测记忆 (升级): 只有**已达标**的目标 (完成因子上界 >= 阈值) 才强惩罚、
-        # 不再重复曝光 (多次曝光不累加); 对"已尝试但未达标"的目标 (上界 < 阈值)
-        # 反而给**重试加成**, 让它们有机会在更好时段/更长曝光下补达标.
-        required_ids = {t.target_id for t in self.targets.targets if t.required}
-        req_threshold = float((self.init.scoring or {}).get("required", {}).get(
-            "observed_factor_threshold", 0.5)) if isinstance(self.init.scoring, dict) else 0.5
-        # 达标阈值: 用 0.5; 上界一致性用 0.55 (留少量余量, 避免误判达标而漏补).
-        sat_threshold = req_threshold
-        for tid in list(self.observed_ids):
-            if tid not in priorities:
-                continue
-            g_upper = self.achieved_g.get(tid)
-            if g_upper is not None and g_upper >= sat_threshold:
-                priorities[tid] -= 5000.0          # 已达标: 不再重复
-            else:
-                # 未达标 (含无估计): 给重试加成 (高于普通目标, 低于必观测锚定).
-                priorities[tid] += 300.0
-        for tid in self.attempted_ids:
-            if tid not in priorities:
-                continue                                # 不可见: 无需调权
-            if tid in required_ids:
-                continue                                # 必观测已单独处理
-            if tid not in self.observed_ids:
-                priorities[tid] -= 100.0                # 尝试过但未命中: 轻微回避
-        # 记录"未完成必观测"集合 (达标阈值判定), 供视场加成与必观测锚定使用.
-        unfinished = set()
-        for tid in required_ids:
-            g_upper = self.achieved_g.get(tid)
-            if g_upper is None:
-                if tid not in self.observed_ids:
-                    unfinished.add(tid)
-            elif g_upper < req_threshold:
-                unfinished.add(tid)
-        self._required_unfinished = unfinished
-        ranked = sorted(visible, key=lambda t: priorities.get(t.target_id, 0.0), reverse=True)
-
-        # 预计算每个目标的 alt/az (避免重复计算)
-        altaz = {t.target_id: radec_to_altaz(t.ra_deg, t.dec_deg, lst, self.lat) for t in ranked}
+        # 有效优先级/排序/请求加成/未完成必观测集合: 由 _prepare_round 每轮只算一次
+        # (见 decide)。这里缺省回退, 以便单独调用本方法时仍可用。
+        if ranked is None or priorities is None:
+            ranked, priorities, request_targets = self._prepare_round(
+                visible, state.observation_requests)
+        required_ids = self._required_ids
 
         # 空间分箱索引 (按 (alt,az) 分箱): 让 _fill_pointing 只遍历视场附近的少量目标,
         # 在大卡 (数万目标 / 100 光纤) 上把每轮决策从 O(N) 降到 O(局部).
         _bin = max(1.0, self._fiber_grid.fov_side_deg)
-        spatial = {
-            "bin_deg": _bin,
-            "index": self._build_spatial_index(ranked, altaz, _bin),
-            "order": {t.target_id: i for i, t in enumerate(ranked)},
-        }
+        index = self._build_spatial_index(ranked, altaz, _bin)
+        order = {t.target_id: i for i, t in enumerate(ranked)}
+        # cache: 同一轮内按 (alt,az) 分箱缓存"邻域目标", 供几十~上百次候选评估复用
+        spatial = {"bin_deg": _bin, "index": index, "order": order, "cache": {}}
 
         best = None  # 兼容旧变量: 最终为 (quality, c_alt, c_az, assignments)
         seen_centers = set()
@@ -1029,7 +1202,7 @@ class Planner:
         #   2) 对最优锚点用全部 16 根光纤的中心偏移做精细搜索.
         # 锚点池: 既取最高优先级, 也按步长在全体可见目标中抽样 (兼顾优先级与密度).
         # 预算紧张时整体收缩 (预算保护).
-        pool_size = {0: self.anchor_pool, 1: 60, 2: 20}[self.pace_level]
+        pool_size = min(PROBE_MAX, {0: self.anchor_pool, 1: 60, 2: 20}[self.pace_level])
         refine = {0: self.refine_anchors, 1: 2, 2: 1}[self.pace_level]
         top = ranked[: pool_size // 2]
         stride = max(1, len(ranked) // max(1, pool_size // 2))
@@ -1060,6 +1233,8 @@ class Planner:
 
         def collect_center(c_alt: float, c_az: float) -> None:
             """评估一个候选中心, 收集其质量分 (供后续带内连续性择优)."""
+            if len(candidates) >= MAX_CENTERS_PER_DECISION:
+                return                      # 每轮候选中心硬上限 (成本与卡规模解耦)
             if not (self.min_alt + 1.0 <= c_alt <= 89.0):
                 return
             key = (round(c_alt, 1), round(c_az, 1))
@@ -1079,15 +1254,22 @@ class Planner:
 
         # 精细搜索: 对最密的若干锚点, 尝试光纤中心偏移. 大网格 (如 10x10=100 光纤)
         # 时对光纤采样, 避免 refine x n_fibers 的候选爆炸 (预算保护).
-        max_fine_fibers = 36
+        max_fine_fibers = FINE_FIBER_MAX
         if self.n_fibers <= max_fine_fibers:
             fine_fibers = range(self.n_fibers)
         else:
             fstep = max(1, self.n_fibers // max_fine_fibers)
             fine_fibers = list(range(0, self.n_fibers, fstep))[:max_fine_fibers]
+        # 注意: collect_center 有全局硬上限, 且按调用顺序生效 —— 必须给每个阶段
+        # 单独定额度, 否则 refine 会把预算吃光, 导致后续"连续性种子"被整段丢弃
+        # (连续性机制会失效)。
+        used_refine = 0
         for _, anchor, _, _ in dense_centers[:refine]:
             a_alt, a_az = altaz[anchor.target_id]
             for fiber_id in fine_fibers:
+                if used_refine >= MAX_REFINE_CENTERS:
+                    break
+                used_refine += 1
                 row, col = divmod(fiber_id, self.grid_side)
                 d_north, d_east = self._fiber_grid.cell_center(row, col)
                 c_alt, c_az = shift_altaz(a_alt, a_az, -d_north, -d_east)
@@ -1095,12 +1277,20 @@ class Planner:
 
         # 必观测锚定: 对当前可见的**未完成必观测目标**, 以"使其落入某光纤"为目标
         # 生成候选中心, 保证每个可见的未完成必观测都有机会在本轮被安排.
+        used_required = 0
         for c_alt, c_az in self._required_anchor_centers(altaz):
+            if used_required >= MAX_REQUIRED_ANCHOR_CENTERS:
+                break
+            used_required += 1
             collect_center(c_alt, c_az)
 
         # 连续性种子: 在上次指向附近、以及沿扫描方向继续处布置候选中心,
         # 使"平滑扫天"的期望视场进入候选集 (否则会被锚点池过滤掉).
+        used_cont = 0
         for c_alt, c_az in self._continuity_seed_centers(altaz):
+            if used_cont >= MAX_CONTINUITY_CENTERS:
+                break
+            used_cont += 1
             collect_center(c_alt, c_az)
 
         if not candidates:
@@ -1119,7 +1309,8 @@ class Planner:
             best = max(band_pool, key=lambda c: self._continuity_bonus(c[1], c[2]))
 
         _, center_alt, center_az, assignments = best
-        duration = self._choose_duration(assignments, seconds_left, altaz, lst, now)
+        duration = self._choose_duration(assignments, seconds_left, altaz, lst, now,
+                                         extra_must_complete=request_targets)
         # 程序选择: LLM 明确指定则用之; 纯静态时按月光+大气质量模型估计档位
         # (DARK×1.20 / BRIGHT×1.12 / BACKUP×1.06; 声明错档只 ×1.00).
         if self.night_plan is not None and self.night_plan.source == "llm" and self.night_plan.program in ("DARK", "BRIGHT", "BACKUP"):
@@ -1251,8 +1442,9 @@ class Planner:
         centers: List[Tuple[float, float]] = []
         if not self._required_unfinished:
             return centers
-        fiber_ids = self._anchor_fibers
-        max_anchor = 24
+        # 预算: 每轮最多 MAX_REQUIRED_ANCHOR_CENTERS 个候选中心 -> 目标数 x 中心光纤数
+        fiber_ids = self._anchor_fibers[:2]
+        max_anchor = max(1, MAX_REQUIRED_ANCHOR_CENTERS // max(1, len(fiber_ids)))
         # 只锚定"当前可见"的未完成必观测目标.
         visible_unfinished = [tid for tid in self._required_unfinished
                               if tid in altaz and altaz[tid][0] >= self.min_alt + ALT_MARGIN_DEG]
@@ -1349,6 +1541,15 @@ class Planner:
         return 0.0
 
 
+    def cpu_summary(self) -> str:
+        """一行性能摘要 (agent 在 finish 时写日志 / 本地预算仿真读取)."""
+        n = self.decision_cpu_count
+        avg_ms = (self.decision_cpu_total / n * 1000.0) if n else 0.0
+        return (f"决策 {n} 轮, 平均 {avg_ms:.0f} ms/决策, 累计 {self.decision_cpu_total:.1f}s CPU, "
+                f"目标 {len(self.targets.targets)} 个 (本轮可见 {self.perf_visible_n}), "
+                f"视场中心评估 {self.perf_fill_calls} 次/轮, numpy={HAVE_NUMPY}")
+
+
     def _fill_pointing(self, ranked, priorities, altaz, center_alt, center_az, spatial=None):
         """在给定指向下, 贪心填充光纤, 返回 (assignments, total_priority).
 
@@ -1359,6 +1560,7 @@ class Planner:
         ``spatial`` 为可选的 (alt,az) 分箱索引: 若提供, 只遍历视场附近的少量目标
         (O(局部) 而非 O(全部目标)), 在 100 光纤 / 数万目标的大卡上显著提速.
         """
+        self.perf_fill_calls += 1       # 性能计数 (只用于日志/本地预算仿真)
         grid = self._fiber_grid
         half = grid.fov_side_deg / 2.0
         assignments: Dict[str, str] = {}
@@ -1414,23 +1616,41 @@ class Planner:
 
     @staticmethod
     def _nearby_targets(spatial, center_alt: float, center_az: float, radius_deg: float):
-        """从分箱索引中取视场附近的目标 (3x3 邻域即可覆盖半径内所有目标)."""
+        """从分箱索引中取视场附近的目标 (3x3 邻域即可覆盖半径内所有目标).
+
+        性能: 一轮里会评估几十到上百个候选中心, 其中很多落在同一个 (alt,az) 分箱,
+        邻域完全相同。这里按分箱缓存结果, 命中时直接返回; 未命中时用 ``heapq.merge``
+        合并各 bin (每个 bin 内部已按优先级有序), 避免每调用一次就整体排序。
+        """
         b = spatial["bin_deg"]
         # 邻域半径以 bin 为单位 (向上取整, 覆盖 radius_deg)
         r = int(radius_deg // b) + 1
         ca = int(center_alt // b)
         cz = int((center_az % 360.0) // b)
+        cache = spatial.get("cache")
+        if cache is not None:
+            hit = cache.get((ca, cz))
+            if hit is not None:
+                return hit
         n_az_bins = max(1, int(360.0 // b) + 1)
-        seen = []
+        order = spatial["order"]
+        lists = []
         for da in range(-r, r + 1):
             ai = ca + da
             for dz in range(-r, r + 1):
                 zi = (cz + dz) % n_az_bins
                 lst = spatial["index"].get((ai, zi))
                 if lst:
-                    seen.extend(lst)
-        # 保持优先级降序: 合并后按原顺序近似即可 (各 bin 内已降序, 这里再排序).
-        seen.sort(key=lambda t: spatial["order"].get(t.target_id, 0.0))
+                    lists.append(lst)
+        if not lists:
+            seen = []
+        elif len(lists) == 1:
+            seen = lists[0]
+        else:
+            # 各 bin 内已按 order 升序 -> 归并即得全局顺序 (O(k log b) 而非整体排序)
+            seen = list(heapq.merge(*lists, key=lambda t: order.get(t.target_id, 0)))
+        if cache is not None:
+            cache[(ca, cz)] = seen
         return seen
 
     def _estimate_program(self, assignments, altaz, lst, now) -> str:
@@ -1467,27 +1687,38 @@ class Planner:
             return "BRIGHT"
         return "BACKUP"
 
-    def _choose_duration(self, assignments, seconds_left: float, altaz, lst, now=None) -> int:
+    def _choose_duration(self, assignments, seconds_left: float, altaz, lst, now=None,
+                         extra_must_complete: Optional[set] = None) -> int:
         """选择曝光时长.
 
         策略 (参考 Cao 2025 的曝光时间计算器思想):
-            * 对**必观测目标**, 计算"达到完成因子 threshold=0.5 所需的最短曝光",
-              并取分配目标中所需最长者, 确保必观测不至于因曝光不足而判漏;
+            * 对**必须完成**的目标 (必观测 + 限时请求目标), 计算"达到完成因子
+              threshold=0.5 所需的最短曝光", 取所需最长者且不缩放;
             * 普通目标用 preplan 的建议曝光 (以计分基准曝光为锚, 按亮度缩放);
-            * 统一按 duration_scale 缩放, 裁剪到 [min, max] 与剩余时间.
+            * **预算紧张时** (pace >= 1) 把曝光拉长到"本视场最后一个目标饱和"的
+              时长 —— 同一枪内所有目标共享曝光时间, 延长到最暗目标饱和既不掉分,
+              又能显著减少决策次数 (这是 CPU 预算的第二杠杆);
+            * 最后裁剪到 [min, max]、剩余时间, 以及"目标掉出高度门槛之前"。
 
         完成因子模型 (公开部分):  g = flux * T * Q / (f0*T0),
         其中 Q ≈ (η·τ·K·L)/(seeing·X^β)/q0. 隐藏项 η·τ·K/s 未知, 这里用一个
         偏保守但合理的公开估计 Q_hat = L/(q0·X^β·seeing_ref) (seeing_ref 取典型值),
         以便在常见天气下把必观测推到 0.5 以上.
         """
+        must_complete = set(extra_must_complete or ())
         seconds = []
-        required_need = 0        # 本视场中必观测目标所需的最短"完成"曝光 (不缩放)
+        required_need = 0        # 本视场中"必须完成"目标所需的最短曝光 (不缩放)
         # 月球只计算一次 (供所有必观测目标的完成因子估算复用).
         moon = None
-        has_required = any(self.targets.index.get(tid) and self.targets.index[tid].required
-                           for tid in assignments.values())
-        if now is not None and has_required:
+        scoring = self.init.scoring if isinstance(self.init.scoring, dict) else {}
+        f0 = float(scoring.get("flux_zero_point", 0.5)) or 0.5
+        t0 = float(scoring.get("exposure_zero_point_seconds", 900.0)) or 900.0
+        needs_moon = any(
+            (self.targets.index.get(tid) is not None
+             and (self.targets.index[tid].required or tid in must_complete))
+            for tid in assignments.values()
+        )
+        if now is not None and needs_moon:
             try:
                 moon = _Moon(now, lst, self.lat)
             except Exception:
@@ -1501,7 +1732,7 @@ class Planner:
                                t.feature_flux, t.science_weight, t.required),
                 self.tool._temp_card([t]),
             )
-            if t.required:
+            if t.required or tid in must_complete:
                 need = self._exposure_for_completion(t, altaz.get(tid), moon)
                 # 时序感知重试升级: 若该必观测目标此前已尝试但未完成, 说明一次
                 # 短曝光在当时的天气/时段下落空; 增大所需曝光 (重试升级), 提高成功
@@ -1522,9 +1753,65 @@ class Planner:
             if required_need >= 0.6 * self.max_exposure:
                 required_duration = self.max_exposure
             duration = max(duration, required_duration)
+
+        # -- 预算紧张: 拉长到"本视场最后一个目标饱和"的时长, 减少决策次数 -------
+        if self.pace_level >= 1 and now is not None and assignments:
+            t_sat = 0.0
+            for tid in assignments.values():
+                t = self.targets.index.get(tid)
+                if t is None:
+                    continue
+                q_hat = self._quality_hat(t, altaz.get(tid), moon)
+                if q_hat <= 0.0:
+                    continue
+                t_sat = max(t_sat, f0 * t0 / (max(1e-6, t.feature_flux) * q_hat))
+            if t_sat > duration:
+                duration = min(self.max_exposure, int(round(t_sat / 30.0) * 30))
+
         duration = max(self.min_exposure, min(self.max_exposure, duration))
         duration = int(max(self.min_exposure, min(duration, seconds_left)))
+        # 预算紧张时才拉长曝光; 既然拉长了, 就用"目标掉出高度门槛之前"给个安全上限
+        # (否则一次长曝光可能中途跌破 30 度, 整枪 0 分)。pace 0 (预算充裕) 不启用,
+        # 保持与既有节奏一致。
+        if self.pace_level >= 1:
+            runway = self._altitude_runway_seconds(assignments, lst)
+            duration = int(max(self.min_exposure, min(duration, runway, seconds_left)))
         return duration
+
+    def _altitude_runway_seconds(self, assignments, lst: float) -> float:
+        """本视场中"最早掉出高度门槛"的目标还能观测多少秒 (留 10% 余量).
+
+        目标是全程 >= 30° 才计分; 这里用 31° (min_alt + 安全余量) 的穿越时刻再乘
+        0.9, 因此不会真的把目标拖到门槛以下。
+        """
+        best = float("inf")
+        for tid in assignments.values():
+            i = self._sky.pos.get(str(tid))
+            if i is None:
+                continue
+            best = min(best, self._sky.seconds_to_set(i, lst))
+        if best == float("inf"):
+            return 1e9
+        return max(60.0, best * 0.9)
+
+    def _quality_hat(self, target: Target, altaz_pair, moon) -> float:
+        """公开可得的天空质量估计 ``Q_hat = L / (q0 * X^beta * seeing_ref)``.
+
+        隐藏项 (η/τ/K/seeing 真值) 不可知, 这里用典型 seeing 取值使估计偏保守
+        (宁可曝光略长)。返回 0 表示无法估计。
+        """
+        if altaz_pair is None:
+            return 0.0
+        scoring = self.init.scoring if isinstance(self.init.scoring, dict) else {}
+        q0 = float(scoring.get("q0", 1.0)) or 1.0
+        beta = float(scoring.get("airmass_exponent", 0.6))
+        lunar_model = scoring.get("lunar_model") or {}
+        alt = altaz_pair[0]
+        airmass = normalized_airmass(max(alt, 1.0))
+        lunar = 1.0
+        if moon is not None:
+            lunar = _lunar_factor(moon, target.ra_deg, target.dec_deg, lunar_model)
+        return lunar / (q0 * (airmass ** beta) * max(1e-6, SEEING_REF_FOR_SCORING))
 
     def _exposure_for_completion(self, target: Target, altaz_pair, moon, threshold: float = 0.5) -> int:
         """估算某目标达到完成因子 ``threshold`` 所需的曝光秒数 (公开模型, 无隐藏真值).
@@ -1535,18 +1822,10 @@ class Planner:
         """
         if altaz_pair is None:
             return self.min_exposure
-        scoring = self.init.scoring or {}
-        q0 = float(scoring.get("q0", 1.0)) or 1.0
+        scoring = self.init.scoring if isinstance(self.init.scoring, dict) else {}
         f0 = float(scoring.get("flux_zero_point", 0.5)) or 0.5
         t0 = float(scoring.get("exposure_zero_point_seconds", 900.0)) or 900.0
-        beta = float(scoring.get("airmass_exponent", 0.6))
-        lunar_model = scoring.get("lunar_model") or {}
-        seeing_ref = SEEING_REF_FOR_SCORING
-
-        alt = altaz_pair[0]
-        airmass = normalized_airmass(max(alt, 1.0))
-        lunar = _lunar_factor(moon, target.ra_deg, target.dec_deg, lunar_model) if moon is not None else 1.0
-        q_hat = lunar / (q0 * (airmass ** beta) * max(1e-6, seeing_ref))
+        q_hat = self._quality_hat(target, altaz_pair, moon)
         flux = max(1e-6, target.feature_flux)
         need = threshold * f0 * t0 / (flux * max(1e-6, q_hat))
         need = max(self.min_exposure, min(self.max_exposure, need))

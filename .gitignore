@@ -151,3 +151,6 @@ sim_data/
 *.gz
 *.7z
 *.rar
+
+# --- 平台构建产物 (官方 FAQ: 依赖装到项目内 .deps, 由 build 步骤生成) ---
+.deps/

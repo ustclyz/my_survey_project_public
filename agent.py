@@ -125,6 +125,10 @@ def main() -> int:
                     log(f"agent: finish termination_reason={payload.get('termination_reason')} "
                         f"observe_actions={payload.get('observe_actions')} "
                         f"reports={planner.reports_made} ")
+                    try:
+                        log(f"agent: 性能摘要 {planner.cpu_summary()}")
+                    except Exception:  # noqa: BLE001 - 摘要失败不影响退出
+                        pass
                 except Exception as exc:  # noqa: BLE001
                     log(f"agent: finish 摘要记录失败 ({type(exc).__name__}: {exc})")
 
