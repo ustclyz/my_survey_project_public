@@ -114,6 +114,8 @@ def run_card(card_name: str, budget: float = DEFAULT_BUDGET_SECONDS,
     planner = Planner(init, PlannerTool(card), llm_planner=None, log_fn=(lambda _s: None))
 
     weight = {t.target_id: t.science_weight for t in card.targets}
+    required_ids = {t.target_id for t in card.targets if t.required}
+    assigned_count = {}          # target_id -> 被指派次数 (用于验证"重试陷阱")
     survey_start = _parse_utc(nights[0]["observing_start_utc"])
     survey_end = _parse_utc(nights[-1]["observing_end_utc"])
     now = survey_start
@@ -161,6 +163,8 @@ def run_card(card_name: str, budget: float = DEFAULT_BUDGET_SECONDS,
             observes += 1
             step = action.exposure_seconds or 900
             tids = list(action.assignments.values())
+            for t in tids:
+                assigned_count[t] = assigned_count.get(t, 0) + 1
             last_result = {"action": "observe", "observe_index": observes,
                            "assigned_count": len(tids), "hit_count": len(tids),
                            "hits": [{"target_id": t, "score": 0.75 * (weight.get(t, 1.0) or 1.0)}
@@ -182,6 +186,8 @@ def run_card(card_name: str, budget: float = DEFAULT_BUDGET_SECONDS,
 
     cpu_seconds = time.process_time() - cpu0
     charged_seconds = cpu_seconds / max(1e-6, speed_factor)
+    req_assigned = sum(1 for t in required_ids if assigned_count.get(t, 0) > 0)
+    repeats = sorted(assigned_count.values(), reverse=True)
     total_span = max(1.0, (survey_end - survey_start).total_seconds())
     covered = (now - survey_start).total_seconds()
     return {
@@ -200,6 +206,12 @@ def run_card(card_name: str, budget: float = DEFAULT_BUDGET_SECONDS,
         "budget_exhausted": exhausted,
         "probe": bool(seq >= max_decisions and now < survey_end),
         "coverage_pct": round(min(100.0, covered / total_span * 100.0), 1),
+        "required_total": len(required_ids),
+        "required_assigned": req_assigned,
+        "required_never_assigned": len(required_ids) - req_assigned,
+        "targets_assigned_distinct": len(assigned_count),
+        "max_repeat": repeats[0] if repeats else 0,
+        "repeat_ge5": sum(1 for c in repeats if c >= 5),
         "perf": planner.cpu_summary(),
     }
 
@@ -246,6 +258,9 @@ def main(argv=None) -> int:
               f"{r['observes']:>8} {r['cpu_seconds']:>9.1f} {r['cpu_ms_per_decision']:>7.1f} "
               f"{r['charged_seconds']:>8.1f} {('Y' if r['finished'] else 'N'):>5} "
               f"{r['coverage_pct']:>6.1f}")
+        print(f"         必观测: 共 {r['required_total']}, 已指派 {r['required_assigned']}, "
+              f"从未指派 {r['required_never_assigned']} | 覆盖目标数 {r['targets_assigned_distinct']} | "
+              f"单目标最多被拍 {r['max_repeat']} 次, >=5 次的有 {r['repeat_ge5']} 个")
     print(f"\nacceptance: charged_seconds < budget ({args.budget:.0f}s); speed_factor={args.speed_factor}")
     return 0
 

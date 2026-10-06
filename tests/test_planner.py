@@ -959,22 +959,150 @@ def test_request_targets_get_priority_bonus():
     late = (now - timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     base = p._all_priorities()
+    # 基线: 不带任何请求时的有效优先级 (用于把"请求加成"与其它加成隔离开)
+    _, baseline, _ = p._prepare_round(visible, [])
+    base_tid = baseline[tid]
+
     # 未过期 -> 加成
     reqs = [{"request_id": "R1", "target_ids": [tid], "minimum_completed": 1,
              "completed_count": 0, "completed_target_ids": [], "deadline_utc": deadline}]
     _, priorities, boosted = p._prepare_round(visible, reqs)
     assert tid in boosted
-    assert priorities[tid] > base.get(tid, 0.0) + 100.0
+    assert priorities[tid] >= base_tid + planner_mod.REQUEST_BONUS
 
     # 已过截止 -> 不加成
     reqs_late = [{"request_id": "R2", "target_ids": [tid], "minimum_completed": 1,
                   "completed_count": 0, "completed_target_ids": [], "deadline_utc": late}]
     _, priorities2, boosted2 = p._prepare_round(visible, reqs_late)
     assert boosted2 == set()
-    assert priorities2[tid] <= base.get(tid, 0.0) + 100.0
+    assert priorities2[tid] == base_tid
 
     # 已达标 -> 不加成
     reqs_done = [{"request_id": "R3", "target_ids": [tid], "minimum_completed": 1,
                   "completed_count": 1, "completed_target_ids": [tid], "deadline_utc": deadline}]
     _, _, boosted3 = p._prepare_round(visible, reqs_done)
     assert boosted3 == set()
+
+
+# ---------------------------------------------------------------------------
+# 必观测保障 / 重试陷阱 (平台实测驱动的修复回归)
+# ---------------------------------------------------------------------------
+
+
+def _run_with_failures(p, nights, n=150, score_frac=0.3):
+    """驱动决策, 并模拟"命中但完成因子偏低"(score = frac x weight) 的反馈.
+
+    这正是平台实测卡B/A1 的情形: 目标被命中但 g<0.5, 于是进入"未达标"状态。
+    """
+    from datetime import timedelta
+    from protocol import DecisionRequest
+
+    weight = {t.target_id: (t.science_weight or 1.0) for t in p.targets.targets}
+    now = datetime.fromisoformat(nights[0]["observing_start_utc"].replace("Z", "+00:00")).astimezone(timezone.utc)
+    end = datetime.fromisoformat(nights[-1]["observing_end_utc"].replace("Z", "+00:00")).astimezone(timezone.utc)
+    last = None
+    seq = 0
+    observed = 0
+    while observed < n and now < end and seq < 400:
+        seq += 1
+        req = DecisionRequest({
+            "decision_sequence": seq,
+            "payload": {"now_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "survey_end_utc": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "wallclock": {"remaining_seconds": 900, "remaining_real_cpu_seconds": 900,
+                                      "wall_remaining_seconds": 1800},
+                        "latest_bulletin": {"notices": []}, "active_requests": [],
+                        "new_messages": [], "last_result": last},
+        })
+        act = p.decide(req)
+        if act.type == "observe":
+            observed += 1
+            now += timedelta(seconds=act.exposure_seconds or 900)
+            tids = list(act.assignments.values())
+            last = {"action": "observe", "assigned_count": len(tids), "hit_count": len(tids),
+                    "hits": [{"target_id": t, "score": score_frac * weight.get(t, 1.0)} for t in tids]}
+        elif act.type == "wait":
+            now += timedelta(seconds=act.duration_seconds or 900)
+            last = {"action": "wait"}
+        else:
+            break
+    return observed
+
+
+def test_retry_trap_is_bounded():
+    """回归: "命中但未达标"的目标不得被无限重试.
+
+    平台实测: 卡B 有 11 个目标被拍 ≥50 次(最多 75 次)而 2.6 万个目标从没被碰过;
+    卡 A1 因此只覆盖 3,445/30,000 个目标, 直接把分数拖到 −57k。
+    """
+    p, nights = _make_planner_with_card("alpha")
+    observed = _run_with_failures(p, nights, n=150)
+    assert observed >= 50, "应产出足够多的观测"
+    worst = max(p.attempt_count.values()) if p.attempt_count else 0
+    # 必须有硬上限 (普通 3 次 / 必观测 8 次)
+    assert worst <= planner_mod.MAX_ATTEMPTS_REQUIRED, f"单个目标被重复指派 {worst} 次, 重试未封顶"
+    # 且必须覆盖到足够多的不同目标 (不能被少数目标占满)
+    assert len(p.attempted_ids) >= 60, f"只覆盖了 {len(p.attempted_ids)} 个不同目标"
+
+
+def test_fresh_targets_get_bonus_and_stale_ones_dropped():
+    """未尝试过的可见目标应有加成; 反复失败的目标应退出本轮选择 (尝试上限)."""
+    p, _ = _make_planner_with_card("alpha")
+    visible = p.targets.targets[:6]
+    fresh, stale = visible[0].target_id, visible[1].target_id
+    # stale: 命中但未达标, 且已尝试超过上限
+    p.observed_ids.add(stale)
+    p.achieved_g[stale] = 0.3
+    p.attempt_count[stale] = planner_mod.MAX_ATTEMPTS_NORMAL + 1
+    p.attempted_ids.add(stale)
+
+    _, priorities, _ = p._prepare_round(visible, [])
+    base = p._all_priorities()
+    assert priorities[fresh] >= base.get(fresh, 0.0) + planner_mod.FRESH_BONUS - 1e-6
+    assert stale not in priorities, "超过尝试上限的目标应退出本轮选择"
+
+
+def test_required_field_quality_dominates_retry_fields():
+    """含未完成必观测的视场, 其质量必须压过任何"重试堆"视场.
+
+    这是 161 个必观测"全场可见却一次没被指派"的直接原因:
+    16 x (基础 ~11 + 重试 300) ≈ 5000 > 必观测场 1000 + 400。
+    """
+    assert planner_mod.REQUIRED_FIELD_DOMINANCE > 16 * (
+        planner_mod.RETRY_BONUS + 100.0), "必观测场权重必须压过重试堆"
+    p, _ = _make_planner_with_card("alpha")
+    assert p.required_field_bonus == planner_mod.REQUIRED_FIELD_DOMINANCE
+
+
+def test_completion_exposure_uses_conservative_quality():
+    """达标曝光必须用"打折"的质量估计 (否则真实 g 会卡在 0.5 以下)."""
+    p, _ = _make_planner_with_card("alpha")
+    t = planner_mod.Target.from_preplan(_load_card("alpha").targets[0])
+    pair = (55.0, 120.0)
+    q_naive = p._quality_hat(t, pair, None)
+    q_cons = p._quality_hat(t, pair, None, conservative=True)
+    assert abs(q_cons / q_naive - planner_mod.COMPLETION_Q_SCALE) < 1e-9
+    assert q_cons < q_naive, "保守估计应更小 -> 曝光更长"
+    # 所需曝光不得短于"乐观估计"下的所需曝光 (允许被 max_exposure 截断)
+    scoring = p.init.scoring or {}
+    f0 = float(scoring.get("flux_zero_point", 0.5)) or 0.5
+    t0 = float(scoring.get("exposure_zero_point_seconds", 900.0)) or 900.0
+    naive_need = 0.5 * f0 * t0 / (max(t.feature_flux, 1e-6) * q_naive)
+    need_cons = p._exposure_for_completion(t, pair, None)
+    assert need_cons >= min(p.max_exposure, naive_need) - 1e-6
+
+
+def test_required_anchor_rotation_avoids_starvation():
+    """必观测锚定必须轮转: 同一批目标不应每轮都被重复锚定."""
+    p, _ = _make_planner_with_card("alpha")
+    required = [t for t in p.targets.targets if t.required][:40]
+    p._required_unfinished = {t.target_id for t in required}
+    # 高度角相同 -> 时序质量打平, 只能靠轮转区分; 目标数 (40) 远多于每轮额度
+    altaz = {t.target_id: (60.0, float(i)) for i, t in enumerate(required)}
+    per_round = max(1, planner_mod.MAX_REQUIRED_ANCHOR_CENTERS // 2)
+    for k in range(1, 7):
+        p.decisions_seen = k
+        assert p._required_anchor_centers_impl(altaz), "应有候选中心"
+    anchored = set(p._last_anchor)
+    assert len(anchored) > per_round, (
+        f"锚定未轮转: 6 轮只锚定了 {len(anchored)} 个不同目标 (每轮上限 {per_round})")

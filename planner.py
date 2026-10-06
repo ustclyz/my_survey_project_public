@@ -61,10 +61,32 @@ MAX_CENTERS_PER_DECISION = 64     # 每轮候选视场中心的硬上限
 PROBE_MAX = 60                    # 稠密探测阶段最多评估的锚点数
 FINE_FIBER_MAX = 16               # 精细搜索时每个锚点采样的光纤中心数
 MAX_REFINE_CENTERS = 32           # 精细搜索阶段最多评估的中心数 (须给后续阶段留额度)
-MAX_REQUIRED_ANCHOR_CENTERS = 12  # 必观测锚定每轮最多生成的候选中心数
+MAX_REQUIRED_ANCHOR_CENTERS = 24  # 必观测锚定每轮最多生成的候选中心数
 MAX_CONTINUITY_CENTERS = 8        # 连续性种子每轮最多生成的候选中心数
 REQUEST_BONUS = 800.0             # 限时观测请求目标的优先级加成
 REQUEST_BONUS_URGENT = 1200.0     # 距截止不足 1 夜时的加成
+
+# 曝光估算的保守系数: 公开模型缺 η/τ/K/seeing 真值, 实测(卡B)表明原估计偏乐观
+# 15~40% (106 个必观测卡在 g∈[0.40,0.50)), 这里把估计质量乘以该系数,
+# 等价于把"达标所需曝光"放大约 1/0.65 ≈ 1.54 倍。
+COMPLETION_Q_SCALE = 0.65
+
+# 必观测视场的"硬优先"权重: 只要视场含 1 个未完成必观测, 其质量就必须压过任何
+# 不含必观测的视场 (含"重试堆"视场, 后者 16x(11+300) ≈ 5000), 否则必观测会被
+# 反复失败的目标挤出局 (实测卡B: 161 个必观测全场可见却一次都没被指派)。
+REQUIRED_FIELD_DOMINANCE = 100000.0
+# 重试加成只给前 N 次尝试; 之后转为抑制, 避免失败目标长期挤占新鲜目标。
+RETRY_BONUS = 300.0
+RETRY_BONUS_MAX_ATTEMPTS = 2
+STALE_PENALTY = 200.0
+# 从未尝试过的可见目标获得加成 (覆盖优先, 防止"只啃硬骨头")。
+FRESH_BONUS = 150.0
+# 必观测锚定冷却: 刚锚定过的目标让位给其它未完成必观测 (轮转, 避免饿死)。
+ANCHOR_COOLDOWN_DECISIONS = 3
+# 每个目标的尝试次数硬上限: 反复失败后不再参与本轮选择, 把时间让给新鲜目标。
+# (实测卡A1: 11 个目标被拍 ≥50 次而 2.6 万个目标从没被碰过 -> 只覆盖 3,445 个目标)
+MAX_ATTEMPTS_NORMAL = 3
+MAX_ATTEMPTS_REQUIRED = 8      # 必观测单个值 50 分, 允许更多次尝试
 
 
 def _julian_date(moment: datetime) -> float:
@@ -443,7 +465,8 @@ class Planner:
         # 必观测保障 (漏一个 -50, 是首要得分项): 未完成必观测集合, 以及"视场覆盖到
         # 未完成必观测目标"的硬加成. 该加成直接进入视场质量, 不参与连续性折中.
         self._required_unfinished: set = set()
-        self.required_field_bonus = 400.0       # 每个未完成必观测目标的视场加成
+        # 每个未完成必观测目标的视场加成: 取"支配性"数值, 保证含必观测的视场必胜
+        self.required_field_bonus = REQUIRED_FIELD_DOMINANCE
         # 时序门控: 未完成必观测仅在"当前高度角 >= 中天高度角的该比例"时才优先锚定
         # (把低仰角窗口让给普通目标), 但重试目标不受限. 实测该门控在部分卡上会推迟
         # 必观测、反而增加漏失, 故默认关闭 (0.0); 保留参数便于按卡调参.
@@ -460,6 +483,8 @@ class Planner:
         # **最佳时段**(中天附近 + 暗夜), 而非"可见即观测". 同时记录尝试次数与已达成
         # 的完成因子, 对"尝试过但未完成"的目标进行**重试**并加大曝光.
         self.required_attempts: Dict[str, int] = {}     # 必观测目标已尝试次数
+        self.attempt_count: Dict[str, int] = {}         # 全部目标已尝试次数 (重试封顶用)
+        self._last_anchor: Dict[str, int] = {}          # 目标最近一次被必观测锚定的轮次
         # 全局"已达成完成因子上界"记忆 (所有目标): score/w = g·m 是 g 的上界; 用于
         # 判断目标是否已达标 (g>=threshold) 或需要重试 (上界仍 < threshold).
         self.achieved_g: Dict[str, float] = {}
@@ -998,6 +1023,13 @@ class Planner:
             降序的可见目标; ``request_targets`` 为本轮获得请求加成的目标集合。
         """
         base = self._all_priorities()
+        # 尝试上限: 反复失败的目标本轮退出选择, 把预算让给从未尝试过的目标。
+        # (只有"重试陷阱"场景才会触发: 正常情况下极少有目标被拍这么多次)
+        required_ids = self._required_ids
+        attempt_count = self.attempt_count
+        visible = [t for t in visible
+                   if attempt_count.get(t.target_id, 0)
+                   < (MAX_ATTEMPTS_REQUIRED if t.target_id in required_ids else MAX_ATTEMPTS_NORMAL)]
         priorities: Dict[str, float] = {t.target_id: base.get(t.target_id, 0.0) for t in visible}
 
         # 本夜规划目标的加成 (LLM/静态策略的落点)
@@ -1020,9 +1052,17 @@ class Planner:
                 if g_upper is not None and g_upper >= threshold:
                     priorities[tid] -= 5000.0
                 else:
-                    priorities[tid] += 300.0
-            elif tid in attempted and tid not in required_ids:
-                priorities[tid] -= 100.0
+                    # 未达标: 只在前 RETRY_BONUS_MAX_ATTEMPTS 次给重试加成,
+                    # 之后转为抑制 —— 否则"失败目标堆"会永久压过新鲜目标。
+                    if self.attempt_count.get(tid, 0) <= RETRY_BONUS_MAX_ATTEMPTS:
+                        priorities[tid] += RETRY_BONUS
+                    else:
+                        priorities[tid] -= STALE_PENALTY
+            elif tid in attempted:
+                if tid not in required_ids:
+                    priorities[tid] -= 100.0
+            else:
+                priorities[tid] += FRESH_BONUS      # 从未尝试过: 覆盖优先
 
         # 限时观测请求目标加成
         request_targets = self._boost_request_targets(requests, priorities, self._now_utc)
@@ -1353,6 +1393,7 @@ class Planner:
         for tid in assignments.values():
             tid = str(tid)
             self.attempted_ids.add(tid)
+            self.attempt_count[tid] = self.attempt_count.get(tid, 0) + 1
             # 时序感知: 记录必观测目标的尝试次数, 供重试优先级与曝光升级使用.
             if tid in required_ids:
                 self.required_attempts[tid] = self.required_attempts.get(tid, 0) + 1
@@ -1448,6 +1489,15 @@ class Planner:
         # 只锚定"当前可见"的未完成必观测目标.
         visible_unfinished = [tid for tid in self._required_unfinished
                               if tid in altaz and altaz[tid][0] >= self.min_alt + ALT_MARGIN_DEG]
+        # 轮转: 刚锚定过的目标本轮让位, 否则"按时序质量排序取前 N 个"会让
+        # 时序质量偏低的目标 (例如中天高度角较低者) 被永久饿死 —— 实测卡B 有
+        # 161 个必观测全场可见 (中位 874 个 slot) 却一次都没被指派。
+        cooldown = ANCHOR_COOLDOWN_DECISIONS
+        seq = self.decisions_seen
+        fresh_pool = [tid for tid in visible_unfinished
+                      if seq - self._last_anchor.get(tid, -10 ** 9) > cooldown]
+        if fresh_pool:
+            visible_unfinished = fresh_pool
 
         def rank_key(tid: str):
             t = self.targets.index.get(tid)
@@ -1485,6 +1535,7 @@ class Planner:
             sampled = rest[::stride][: max_anchor - len(head)]
             candidates_anchor = head + sampled
         for tid in candidates_anchor:
+            self._last_anchor[tid] = seq      # 记录锚定时刻, 供下一轮轮转
             a_alt, a_az = altaz[tid]
             for fiber_id in fiber_ids:
                 row, col = divmod(fiber_id, self.grid_side)
@@ -1794,11 +1845,16 @@ class Planner:
             return 1e9
         return max(60.0, best * 0.9)
 
-    def _quality_hat(self, target: Target, altaz_pair, moon) -> float:
+    def _quality_hat(self, target: Target, altaz_pair, moon,
+                     conservative: bool = False) -> float:
         """公开可得的天空质量估计 ``Q_hat = L / (q0 * X^beta * seeing_ref)``.
 
         隐藏项 (η/τ/K/seeing 真值) 不可知, 这里用典型 seeing 取值使估计偏保守
         (宁可曝光略长)。返回 0 表示无法估计。
+
+        ``conservative=True`` 时再乘 ``COMPLETION_Q_SCALE`` (≈0.65), 专用于
+        "达标所需曝光"的推算: 平台实测 (卡B) 106 个必观测的最好成绩卡在
+        g∈[0.40,0.50) 且曝光远未触顶, 说明原估计偏乐观 15~40%, 直接导致漏失。
         """
         if altaz_pair is None:
             return 0.0
@@ -1811,7 +1867,8 @@ class Planner:
         lunar = 1.0
         if moon is not None:
             lunar = _lunar_factor(moon, target.ra_deg, target.dec_deg, lunar_model)
-        return lunar / (q0 * (airmass ** beta) * max(1e-6, SEEING_REF_FOR_SCORING))
+        q = lunar / (q0 * (airmass ** beta) * max(1e-6, SEEING_REF_FOR_SCORING))
+        return q * (COMPLETION_Q_SCALE if conservative else 1.0)
 
     def _exposure_for_completion(self, target: Target, altaz_pair, moon, threshold: float = 0.5) -> int:
         """估算某目标达到完成因子 ``threshold`` 所需的曝光秒数 (公开模型, 无隐藏真值).
@@ -1825,7 +1882,8 @@ class Planner:
         scoring = self.init.scoring if isinstance(self.init.scoring, dict) else {}
         f0 = float(scoring.get("flux_zero_point", 0.5)) or 0.5
         t0 = float(scoring.get("exposure_zero_point_seconds", 900.0)) or 900.0
-        q_hat = self._quality_hat(target, altaz_pair, moon)
+        # conservative=True: 用打了折的质量估计反解曝光, 保证真实 g 越过 0.5
+        q_hat = self._quality_hat(target, altaz_pair, moon, conservative=True)
         flux = max(1e-6, target.feature_flux)
         need = threshold * f0 * t0 / (flux * max(1e-6, q_hat))
         need = max(self.min_exposure, min(self.max_exposure, need))
