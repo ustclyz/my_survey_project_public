@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -65,13 +66,27 @@ def main(argv=None) -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--messages", required=True, help="一次平台运行的 messages.jsonl")
     parser.add_argument("--card", default="cardA", help="提供仪器/计分配置的卡 (A1 与 A 相同)")
+    parser.add_argument("--relay", action="store_true",
+                        help="用平台 relay(kimi) 真机解析 (否则用 stub); 需要 ~/.config/survey26 的 token")
+    parser.add_argument("--limit", type=int, default=0, help="只跑前 N 条 (>0 时生效)")
     args = parser.parse_args(argv)
 
     card = preplan.CardData.from_card(args.card)
     init = _build_init(card, _load_nights(card))
     init["site"]["utc_offset_hours"] = -4.0
     agent = ObserverAgent(init, rules_only=True)
-    agent.client = _StubClient()
+    if args.relay:
+        token = json.loads(Path(os.path.expanduser("~/.config/survey26/config.json"))
+                           .read_text(encoding="utf-8")).get("token", "")
+        os.environ["OPENAI_API_KEY"] = token
+        os.environ["OPENAI_BASE_URL"] = ("https://vdiemcofukuxglqsmlyz.supabase.co"
+                                         "/functions/v1/kimi-relay/v1")
+        os.environ["OPENAI_MODEL"] = "kimi-for-coding"
+        from pro.llm_client import LLMClient
+        agent.client = LLMClient(log=lambda text: print("[llm]", text[:160]), call_timeout=180.0)
+        print("使用 relay 真机模型解析 (逐条, 串行)")
+    else:
+        agent.client = _StubClient()
 
     payloads = []
     with open(args.messages, encoding="utf-8") as fh:
@@ -84,18 +99,37 @@ def main(argv=None) -> int:
                 payloads.append(obj)
 
     print(f"值班日志条数: {len(payloads)}")
+    used = 0
     for idx, obj in enumerate(payloads, 1):
         text = str(obj.get("reason") or "")
         if len(text) < 80:
             continue
+        if args.limit and used >= args.limit:
+            break
+        used += 1
         agent.duty_pending.append({"issued_at_utc": obj.get("issued_at_utc"), "duty_log": text})
         agent._duty_tick({"now_utc": obj.get("issued_at_utc")})
-        msgs = agent.client.requests[-1]
-        users = sum(1 for m in msgs if m["role"] == "user")
-        assistants = sum(1 for m in msgs if m["role"] == "assistant")
-        print(f"  #{idx:>2} chars={agent._duty_chars():>7}  msgs={len(msgs):>3} "
-              f"(user={users}, assistant={assistants})  report={len(agent.duty_times)} "
-              f"terrain={agent.planner.terrain_min_alt} avoid={sorted(agent.planner.extra_avoid)}")
+        if args.relay and agent.duty_call is not None:
+            agent.duty_call.wait(200.0)
+            agent._duty_tick({"now_utc": obj.get("issued_at_utc")})   # 收取上一轮结果
+        if args.relay:
+            print(f"  #{idx:>2} chars={agent._duty_chars():>7} report={len(agent.duty_times)} "
+                  f"no_report={len(agent.duty_no_report)} avoid={sorted(agent.planner.extra_avoid)} "
+                  f"terrain={agent.planner.terrain_min_alt} bad={len(agent.duty_bad_nights)} "
+                  f"prefer={agent.planner.llm_prefer} dur={agent.planner.llm_duration_scale} "
+                  f"lam={agent.planner.llm_lambda_scale}")
+        else:
+            msgs = agent.client.requests[-1]
+            users = sum(1 for m in msgs if m["role"] == "user")
+            assistants = sum(1 for m in msgs if m["role"] == "assistant")
+            print(f"  #{idx:>2} chars={agent._duty_chars():>7}  msgs={len(msgs):>3} "
+                  f"(user={users}, assistant={assistants})  report={len(agent.duty_times)} "
+                  f"terrain={agent.planner.terrain_min_alt} avoid={sorted(agent.planner.extra_avoid)}")
+    if args.relay:
+        print("\n=== 最终解析出的报修时刻 (UTC) ===")
+        for moment in agent.duty_times:
+            print("  ", moment.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        print("notes:", str(agent.duty_state.get("notes") or "")[:300])
     return 0
 
 

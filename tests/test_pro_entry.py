@@ -355,3 +355,24 @@ def test_llm_client_uses_reasoning_content_when_content_empty():
     finally:
         urllib.request.urlopen = original
     assert out == {"report_utc": ["2026-10-02T01:30:00Z"]}
+
+
+def test_duty_llm_sees_run_state_and_can_demand_report():
+    """值班日志 LLM 不仅读日志, 还能看到现场态势并直接要求"立即报修"."""
+    agent = _duty_agent()
+    snapshot = agent._run_state_snapshot({"now_utc": "2026-10-02T01:00:00Z"})
+    for key in ("now_utc", "nights_left", "reports", "quality", "notices_now"):
+        assert key in snapshot
+    assert snapshot["quality"]["scale_now"] > 0.0
+
+    # LLM 判定"现在是仪器故障" -> 直接触发报修
+    agent._apply_duty({"report_now": True, "fault_likely": 0.9})
+    out = agent._maybe_report(100.0, {"now_utc": "2026-10-02T01:10:00Z"})
+    assert out is not None and out["action"] == "report"
+    # 只消费一次, 不会连环报修
+    assert agent._maybe_report(101.0, {"now_utc": "2026-10-02T01:11:00Z"}) is None
+
+    # 把握度不足 -> 忽略
+    agent._apply_duty({"report_now": True, "fault_likely": 0.1})
+    agent.last_report_hours = -1e9
+    assert agent._maybe_report(102.0, {"now_utc": "2026-10-02T01:12:00Z"}) is None

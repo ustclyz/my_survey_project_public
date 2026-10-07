@@ -75,6 +75,7 @@ DUTY_MIN_CHARS = _env("DUTY_MIN_CHARS", 80)
 DUTY_REPORT_WINDOW_HOURS = _env("DUTY_REPORT_WINDOW_HOURS", 12.0)
 DUTY_HISTORY_CHARS = _env("DUTY_HISTORY_CHARS", 40000)   # 多轮历史的总字符预算
 DUTY_NO_REPORT_HOURS = _env("DUTY_NO_REPORT_HOURS", 1.0)  # 平场灯/镜盖测试窗口的半宽
+DUTY_REPORT_MIN_LIKELY = _env("DUTY_REPORT_MIN_LIKELY", 0.5)  # 采纳"立即报修"所需的最低把握度
 DUTY_SYSTEM = """你是天文台的值班助手, 负责把站里的【值班日志】变成可执行的运行决策。
 日志用中文/日文/英文混写; 有的句子用凯撒密码(英文字母整体位移, 位移量常等于写那条日志当天的日期)、
 摩斯电码、唱名(do=1 re=2 mi=3 fa=4 sol=5 la=6 si=7, 高音do=8, 高音re=9, 休止=0)伪装。
@@ -106,6 +107,8 @@ DUTY_SYSTEM = """你是天文台的值班助手, 负责把站里的【值班日�
  "prefer_targets": ["V4T001234", ...],
  "duration_scale": 1.0,
  "lambda_scale": 1.0,
+ "report_now": false,
+ "fault_likely": 0.0,
  "notes": "200 字以内, 记录仍需记住的约定与未决事项",
  "reason": "15 words 以内的理由"}
 所有时刻都是【绝对 UTC】。report_utc 要包含所有已预告但还没报修的故障时刻(含过去漏掉的);
@@ -114,10 +117,15 @@ DUTY_SYSTEM = """你是天文台的值班助手, 负责把站里的【值班日�
 下面这些键是**直接作用到观测决策**的旋钮 (这是你影响决策的方式, 别浪费):
 * prefer_directions: 日志里点名"照拍得比较好 / 重点保住"的方位, weight 0..1, 越大越优先。
 * prefer_targets: 日志/请求点名要保住的**公开目标 ID**(必须来自输入里出现过的 ID, 不确定就别填)。
-* duration_scale: 0.5~2.0。日志说"暗弱目标难做/天气好"就调大(曝光更长), 说"时间紧/覆盖优先"就调小。
+ * duration_scale: 0.5~2.0。日志说"暗弱目标难做/天气好"就调大(曝光更长), 说"时间紧/覆盖优先"就调小。
 * lambda_scale: 0.3~2.0。调小 = 更愿意把单个目标打满(时间不值钱); 调大 = 更看重多拍新目标(时间紧)。
 * bad_nights 里的夜晚, planner 会当成坏夜, 不把暗弱必观测押上去。
-以上旋钮按"本期整体状态"给; 没有依据就填 1.0 / 空数组。只输出 JSON, 不要解释。"""
+* report_now: 你除了读日志, 还会看到**本站自己的运行态势**(run_state: 最近几小时的质量读
+  数 scale、E、已报修次数与对错、距上次报修多久、当前公告、剩余夜数)。当"日志没说、但现场读数
+  明显是仪器故障"(质量长时间塌到晴夜的很小比例, 且不是公告天气/地震/平场灯时段)时, 设
+  report_now=true 让智能体立刻报修; 其余情况 false。fault_likely 给 0~1 的把握程度。
+  report_now 只有在你确信时才置 true —— 误报要扣分。
+以上旋钮按"本期整体状态"给; 没有依据就填 1.0 / 空数组 / false。只输出 JSON, 不要解释。"""
 # The participant guide: an earthquake (announced in the bulletin) lowers instrument efficiency, the loss fades
 # night by night, and a report does not repair it. So E drops right after an earthquake are not reportable, and
 # while its effect may last only a new step down in E (a fresh drop from the preceding hours) is fault evidence.
@@ -225,6 +233,7 @@ class ObserverAgent:
         self.duty_bad_nights: set = set()
         self.duty_updates = 0
         self.consecutive_reports = 0
+        self._hours_now = 0.0            # 模拟小时数 (由 _respond 更新; 供现场态势快照使用)
         # pace state
         self.cost_ema = [0.0, 0.0, 0.0, 0.0]     # CPU seconds per observe decision at each search level
         self.wall_ema = [0.0, 0.0, 0.0, 0.0]     # real seconds per observe decision (own turn, model waits excluded)
@@ -459,6 +468,12 @@ class ObserverAgent:
             return None
         if hours - self.quake_onset_hours < QUAKE_HOLD_HOURS:
             return None   # the earthquake explains the drop; a report would not repair it
+        # 值班日志 LLM 看过现场态势后要求"立即报修" (日志没明说、但读数明显异常时的兜底判断)
+        if self._duty_wants_report():
+            self.last_report_hours = hours
+            self.reports += 1
+            log(f"pro: report at {payload['now_utc']} (值班日志 LLM 依据现场态势判定仪器故障)")
+            return {"action": "report", "reason": "duty-log LLM: instrument fault with run state"}
         if self._fault_verdict(hours, payload) and self._model_agrees(hours, payload):
             self.last_report_hours = hours
             self.reports += 1
@@ -622,6 +637,7 @@ class ObserverAgent:
             "duty_log": "\n\n".join(str(e.get("duty_log") or "") for e in self.duty_pending),
             "local_utc_offset_hours": self.utc_offset_hours,
             "issued_now_utc": payload.get("now_utc"),
+            "run_state": self._run_state_snapshot(payload),
         }
         self.duty_history.append({"role": "user",
                                   "content": json.dumps(turn, ensure_ascii=False, separators=(",", ":"))})
@@ -638,6 +654,26 @@ class ObserverAgent:
 
     def _duty_chars(self) -> int:
         return sum(len(m.get("content") or "") for m in self.duty_history)
+
+    def _run_state_snapshot(self, payload: dict) -> dict:
+        """给模型看的"现场态势": 它据此不仅读日志, 还能判断要不要立即报修/调策略."""
+        hours = float(getattr(self, "_hours_now", 0.0) or 0.0)
+        recent = [sorted(samples)[len(samples) // 2]
+                  for _, samples in sorted(self.scale_hours.items())[-6:] if samples]
+        now = self.last_now
+        nights_left = sum(1 for _, end in self.planner.nights if now is None or end > now)
+        return {
+            "now_utc": payload.get("now_utc"),
+            "nights_left": nights_left,
+            "reports": {"made": self.reports, "correct": self.correct_reports, "false": self.false_reports},
+            "hours_since_last_report": (None if self.reports == 0
+                                        else round(hours - self.last_report_hours, 1)),
+            "quality": {"scale_now": round(float(self.planner.scale), 3),
+                        "recent_hourly_scale": [round(float(x), 3) for x in recent],
+                        "E_now": (lambda value: None if value is None else round(float(value), 3))(
+                            self.planner.clean_e(hours))},
+            "notices_now": [f"{kind} {direction}" for kind, direction in sorted(self.planner.notices)],
+        }
 
     def _trim_duty_history(self) -> None:
         """历史超预算时, 成对丢弃最早的 user/assistant 轮, 并在头部放一条"继承状态"."""
@@ -727,6 +763,20 @@ class ObserverAgent:
             if abs((now - moment).total_seconds()) <= half:
                 return True
         return False
+
+    def _duty_wants_report(self) -> bool:
+        """值班日志 LLM 在看过现场态势后是否要求"立即报修" (消费一次, 避免重复触发)."""
+        if not isinstance(self.duty_state, dict) or not self.duty_state.get("report_now"):
+            return False
+        self.duty_state["report_now"] = False        # 只消费一次, 等下一轮日志再判断
+        try:
+            likely = float(self.duty_state.get("fault_likely", 1.0))
+        except (TypeError, ValueError):
+            likely = 1.0
+        if likely < DUTY_REPORT_MIN_LIKELY:
+            log(f"pro: duty LLM 建议报修但把握度 {likely:.2f} < {DUTY_REPORT_MIN_LIKELY}, 忽略")
+            return False
+        return True
 
     def _due_report(self, now):
         """到点的排程报修. 连续 report 不能超过平台上限 (32), 所以每报 3 次先做点别的."""
