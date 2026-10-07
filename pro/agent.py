@@ -79,6 +79,17 @@ DUTY_REPORT_MIN_LIKELY = _env("DUTY_REPORT_MIN_LIKELY", 0.5)  # 采纳"立即报
 # 值班日志要解密(凯撒/摩斯/唱名)并输出全量状态, 2000 token 会被推理吃光导致 content 为空/截断
 # (实测 v10/v11 共 55 次调用 100% 失败) —— 这里给它单独放大输出预算。
 DUTY_MAX_TOKENS = _env("DUTY_MAX_TOKENS", 6000)
+DUTY_SIMPLE_RETRY = _env("DUTY_SIMPLE_RETRY", 1)     # 全量调用失败时降级重试 (只问报修时刻)
+DUTY_SIMPLE_SYSTEM = (
+    "你是天文台的值班日志解析器。输入是一段中/日/英文混写的值班日志(可能用凯撒密码/摩斯电码/"
+    "唱名伪装)。你只做一件事: 找出所有\"动导星相机\"的时刻 —— 从那一刻起所有曝光都是废片, "
+    "一直到有人报修为止, 所以必须在那个时刻报修。\n"
+    "注意: \"平场灯/镜盖测试\"时段也是废片, 但**不是故障**, 不要列出来; "
+    "\"听说的/没确认\"是传闻要丢弃; \"取消/不动/别报\"要删掉; \"推迟/延后/更正\"要用最终时间; "
+    "标明东京时间(UTC+9)或(UTC)的要换算。\n"
+    "只输出一个 JSON 对象: {\"report_utc\": [\"YYYY-MM-DDTHH:MM:SSZ\", ...]}, 所有时刻为绝对 UTC。"
+    "不要输出任何解释。"
+)
 DUTY_SYSTEM = """你是天文台的值班助手, 负责把站里的【值班日志】变成可执行的运行决策。
 日志用中文/日文/英文混写; 有的句子用凯撒密码(英文字母整体位移, 位移量常等于写那条日志当天的日期)、
 摩斯电码、唱名(do=1 re=2 mi=3 fa=4 sol=5 la=6 si=7, 高音do=8, 高音re=9, 休止=0)伪装。
@@ -236,6 +247,7 @@ class ObserverAgent:
         self.duty_no_report: list = []   # "废片但不是故障"的窗口中心 (UTC)
         self.duty_bad_nights: set = set()
         self.duty_updates = 0
+        self.duty_simple = False         # 当前在飞的是否为"降级重试"
         self.consecutive_reports = 0
         self._hours_now = 0.0            # 模拟小时数 (由 _respond 更新; 供现场态势快照使用)
         # pace state
@@ -619,8 +631,11 @@ class ObserverAgent:
             if not self.duty_call.done():
                 return                      # 上一轮还没回来: 先攒着, 下轮再发
             answer = self.client.collect(self.duty_call)
+            simple, self.duty_simple = self.duty_simple, False
             self.duty_call = None
-            if answer is None:
+            if answer is None and simple:
+                log("pro: 值班日志简化重试也失败; 放弃这一段 (兜底规则仍会报修)")
+            elif answer is None:
                 # 调用失败: 把这一轮从历史里撤掉, 日志下次重发 (不把失败当结论)
                 if self.duty_history and self.duty_history[-1].get("role") == "user":
                     dropped = self.duty_history.pop()
@@ -631,10 +646,16 @@ class ObserverAgent:
                                                          "duty_log": again["duty_log"]})
                     except (ValueError, TypeError):
                         pass
+                if DUTY_SIMPLE_RETRY and self.duty_pending:
+                    self._duty_simple(payload)     # 降级: 只问"要报修的绝对 UTC 时刻"
+                    return
             else:
-                self.duty_history.append({"role": "assistant",
-                                          "content": json.dumps(answer, ensure_ascii=False, separators=(",", ":"))})
-                self._apply_duty(answer)
+                if simple:
+                    self._apply_duty_simple(answer)
+                else:
+                    self.duty_history.append({"role": "assistant",
+                                              "content": json.dumps(answer, ensure_ascii=False, separators=(",", ":"))})
+                    self._apply_duty(answer)
         if not self.duty_pending:
             return
         turn = {
@@ -660,6 +681,35 @@ class ObserverAgent:
     def _duty_chars(self) -> int:
         return sum(len(m.get("content") or "") for m in self.duty_history)
 
+    def _duty_simple(self, payload: dict) -> None:
+        """降级重试: 不带历史、不要富字段, 只让模型列出"需要报修的绝对 UTC 时刻"。
+
+        值班日志里最值钱的信息就是这些时刻; 富字段(规避/地形/坏夜)拿不到也能靠规则兜底。
+        """
+        if self.client is None or not self.duty_pending:
+            return
+        text = "\n\n".join(str(e.get("duty_log") or "") for e in self.duty_pending)
+        user = json.dumps({"duty_log": text, "local_utc_offset_hours": self.utc_offset_hours,
+                           "now_utc": payload.get("now_utc")}, ensure_ascii=False)
+        messages = [{"role": "system", "content": DUTY_SIMPLE_SYSTEM},
+                    {"role": "user", "content": user}]
+        call = self.client.submit_messages("duty_simple", messages, self._clock(payload)[1],
+                                           max_tokens=DUTY_MAX_TOKENS)
+        if call is None:
+            return
+        self.duty_call = call
+        self.duty_simple = True
+        self.duty_pending = []
+        log(f"pro: 值班日志全量解析失败 -> 降级重试 (只问报修时刻, {len(text)} 字)")
+
+    def _apply_duty_simple(self, answer) -> None:
+        """降级重试的答案: 只并入 report_utc, 不动富字段 (富字段留给全量轮次)."""
+        if not isinstance(answer, dict):
+            return
+        times = {m for m in (self._duty_time(x) for x in (answer.get("report_utc") or [])) if m}
+        self.duty_times = sorted((set(self.duty_times) | times) - self.duty_done)
+        self.duty_updates += 1
+        log(f"pro: duty log(简化) -> 共排程 {len(self.duty_times)} 个报修时刻")
     def _run_state_snapshot(self, payload: dict) -> dict:
         """给模型看的"现场态势": 它据此不仅读日志, 还能判断要不要立即报修/调策略."""
         hours = float(getattr(self, "_hours_now", 0.0) or 0.0)

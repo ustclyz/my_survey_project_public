@@ -409,3 +409,19 @@ def test_duty_llm_sees_run_state_and_can_demand_report():
     agent._apply_duty({"report_now": True, "fault_likely": 0.1})
     agent.last_report_hours = -1e9
     assert agent._maybe_report(102.0, {"now_utc": "2026-10-02T01:12:00Z"}) is None
+
+
+def test_duty_simple_retry_recovers_report_times():
+    """全量解析失败时, 降级重试("只问报修时刻")仍能把时刻拿回来."""
+    agent = _duty_agent([
+        None,                                      # 第一次(全量)调用失败
+        {"report_utc": ["2026-10-02T01:30:00Z"]},  # 降级重试成功
+    ])
+    payload = {"now_utc": "2026-10-02T00:00:00Z"}
+    agent.duty_pending = [{"issued_at_utc": "2026-10-02T00:00:00Z", "duty_log": "X" * 120}]
+    agent._duty_tick(payload)          # 提交全量调用
+    assert agent.client.requests[-1][0]["role"] == "system"
+    agent._duty_tick(payload)          # 收到失败 -> 自动降级重试
+    assert agent.duty_simple is True
+    agent._duty_tick(payload)          # 收到降级答案
+    assert [t.strftime("%Y-%m-%dT%H:%M:%SZ") for t in agent.duty_times] == ["2026-10-02T01:30:00Z"]
