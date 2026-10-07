@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from datetime import timedelta
@@ -256,6 +257,13 @@ class ObserverAgent:
         self.duty_simple = False         # 当前在飞的是否为"降级重试"
         self.consecutive_reports = 0
         self._hours_now = 0.0            # 模拟小时数 (由 _respond 更新; 供现场态势快照使用)
+        # Hard 模式 (A1-D1) 才需要"绝对质量下限"这条激进判据: 那些卡有值班日志预告的导星相机
+        # 故障, 不报修就永久废数据。普通卡 (A-D) 偶发的低质量小时是天气, 激进判据会变成连续
+        # 误报 (实测 v12 在卡 A 掉了 2077 分 ≈ 14 次付费误报)。所以按"收到过值班日志"
+        # 或任务卡 slug 里的 a1/b1/c1/d1 来启用。
+        task_card = init.get("task_card") or {}
+        slug = str(task_card.get("scenario_slug") or task_card.get("card_id") or "").lower()
+        self.hard_mode = bool(re.search(r"(^|[-_])[abcd]1($|[-_])", slug))
         # pace state
         self.cost_ema = [0.0, 0.0, 0.0, 0.0]     # CPU seconds per observe decision at each search level
         self.wall_ema = [0.0, 0.0, 0.0, 0.0]     # real seconds per observe decision (own turn, model waits excluded)
@@ -308,6 +316,7 @@ class ObserverAgent:
             elif message.get("record_type") == "observation_request":
                 text = str(message.get("reason") or "")
                 if DUTY_ENABLED and len(text) >= DUTY_MIN_CHARS:
+                    self.hard_mode = True   # 值班日志只出现在 Hard 模式卡 (A1-D1)
                     self.duty_pending.append({"issued_at_utc": message.get("issued_at_utc"), "duty_log": text})
                     self._duty_tick(payload)
         last = payload.get("last_result") or {}
@@ -538,6 +547,8 @@ class ObserverAgent:
             else:
                 return False
         if scale_fault:
+            if not self.hard_mode:
+                return False   # 普通卡: 偶发低质量按天气处理, 不做激进报修
             if self._scale_fault_blocked():
                 return False
             log(f"pro: scale {self.planner.scale:.3f} < {SCALE_FAULT_LEVEL} for {SCALE_FAULT_HOURS}h "
