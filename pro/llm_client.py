@@ -56,12 +56,16 @@ def _extract_json(text: str):
                 candidates.append(text[start:index + 1])
                 start = None
     for candidate in reversed(candidates):
-        try:
-            parsed = json.loads(candidate)
-        except (ValueError, TypeError):
-            continue
-        if isinstance(parsed, dict):
-            return parsed
+        # 常见坏法: 字符串里带裸换行/制表符, 或对象尾部多一个逗号 -> 修一下再试
+        repaired = re.sub(r"[\x00-\x1f]", " ", candidate)
+        repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+        for text_try in (candidate, repaired):
+            try:
+                parsed = json.loads(text_try)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(parsed, dict):
+                return parsed
     return None
 
 

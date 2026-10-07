@@ -355,6 +355,10 @@ def test_llm_extract_json_handles_reasoning_models():
     assert _extract_json(messy) == {"report_utc": ["2026-10-02T01:30:00Z"]}
     assert _extract_json("没有 JSON") is None
     assert _extract_json("") is None
+    # 字符串里有裸换行 + 对象尾部多逗号 -> 修复后仍能解析 (LLM 最常见的两种坏 JSON)
+    broken = '{"report_utc": [], "notes": "a\nb",}'
+    parsed = _extract_json(broken)
+    assert parsed is not None and parsed["report_utc"] == [] and parsed["notes"] == "a b"
 
 
 def test_llm_client_uses_reasoning_content_when_content_empty():
