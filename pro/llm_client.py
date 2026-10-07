@@ -24,27 +24,18 @@ import urllib.request
 DEFAULT_BASE_URL = "https://api.kimi.com/coding/v1"
 DEFAULT_MODEL = "k3"
 _JSON_OBJECT = re.compile(r"\{.*\}", re.S)
+# 各类调用期望出现的"答案字段": 用来在模型回复里挑出**真正的答案对象**, 而不是推理文本里的
+# 草稿/空 {} / 提示词模板回显。(v12 实测: 31 次解析"成功"但全是空的, 就是抓错了对象。)
+_ANSWER_KEYS = ("report_utc", "no_report_utc", "avoid_directions", "terrain", "bad_nights",
+                "prefer_directions", "prefer_targets", "duration_scale", "lambda_scale",
+                "report_now", "fault_likely", "bad_night", "avoid", "report", "action", "reason")
 
 
-def _extract_json(text: str):
-    """从模型回复里取一个 JSON 对象.
-
-    先试整段贪心匹配; 不行再扫描所有**括号平衡**的候选, 从后往前找第一个能解析的
-    (推理型模型的 reasoning_content 里常混着若干 JSON 片段, 真正答案在最后)。
-    """
-    if not text:
-        return None
-    match = _JSON_OBJECT.search(text)
-    if match:
-        try:
-            parsed = json.loads(match.group(0))
-            if isinstance(parsed, dict):
-                return parsed
-        except (ValueError, TypeError):
-            pass
+def _balanced_objects(text: str) -> list:
+    """text 里所有**括号平衡**的 {..} 片段 (按出现顺序)."""
+    out = []
     depth = 0
     start = None
-    candidates = []
     for index, char in enumerate(text):
         if char == "{":
             if depth == 0:
@@ -53,20 +44,55 @@ def _extract_json(text: str):
         elif char == "}" and depth:
             depth -= 1
             if depth == 0 and start is not None:
-                candidates.append(text[start:index + 1])
+                out.append(text[start:index + 1])
                 start = None
-    for candidate in reversed(candidates):
+    return out
+
+
+def _answer_score(obj: dict) -> int:
+    """越大越像"真正的答案": 有非空的报修时刻/坏夜/动作/把握度最重。"""
+    score = 0
+    if isinstance(obj.get("report_utc"), list) and obj["report_utc"]:
+        score += 3
+    for key in ("bad_night", "fault_likely", "action", "report"):
+        if key in obj:
+            score += 2
+    for key in ("avoid_directions", "terrain", "bad_nights", "prefer_directions", "avoid"):
+        if isinstance(obj.get(key), list) and obj[key]:
+            score += 1
+    return score
+
+
+def _extract_json(text: str):
+    """从模型回复里取一个 JSON 对象.
+
+    候选 = 贪心匹配 + 所有括号平衡片段; 其中"含答案字段且内容非空"的得分最高, 同分取最后
+    出现的(最终答案)。这样既不会抓到推理里的空 {}, 也不会抓到提示词模板回显。
+    """
+    if not text:
+        return None
+    candidates = []
+    match = _JSON_OBJECT.search(text)
+    if match:
+        candidates.append(match.group(0))
+    candidates.extend(_balanced_objects(text))
+    parsed: list = []
+    for candidate in candidates:
         # 常见坏法: 字符串里带裸换行/制表符, 或对象尾部多一个逗号 -> 修一下再试
         repaired = re.sub(r"[\x00-\x1f]", " ", candidate)
         repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
         for text_try in (candidate, repaired):
             try:
-                parsed = json.loads(text_try)
+                obj = json.loads(text_try)
             except (ValueError, TypeError):
                 continue
-            if isinstance(parsed, dict):
-                return parsed
-    return None
+            if isinstance(obj, dict):
+                parsed.append(obj)
+                break
+    if not parsed:
+        return None
+    best_index = max(range(len(parsed)), key=lambda i: (_answer_score(parsed[i]), i))
+    return parsed[best_index]
 
 
 def _prefix_order() -> list:
@@ -199,6 +225,9 @@ class LLMClient:
             raw = (message.get("content") or "") or (message.get("reasoning_content") or "")
             self.log(f"llm: 回复里没有 JSON, 原文前 400 字: {raw[:400]!r}")
             raise ValueError("no JSON object in the reply")
+        if not any(key in parsed for key in _ANSWER_KEYS):
+            raw = (message.get("content") or "") or (message.get("reasoning_content") or "")
+            self.log(f"llm: 解析到的对象没有已知字段 {sorted(parsed)[:6]}, 原文前 300 字: {raw[:300]!r}")
         return parsed
 
     def in_flight(self) -> int:

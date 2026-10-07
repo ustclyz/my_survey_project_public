@@ -425,3 +425,21 @@ def test_duty_simple_retry_recovers_report_times():
     assert agent.duty_simple is True
     agent._duty_tick(payload)          # 收到降级答案
     assert [t.strftime("%Y-%m-%dT%H:%M:%SZ") for t in agent.duty_times] == ["2026-10-02T01:30:00Z"]
+
+
+def test_llm_extract_json_picks_the_real_answer_not_a_draft():
+    """v12 的真实故障: 推理文本里混着空 {} / 提示词模板, 必须挑出真正含报修时刻的对象."""
+    from pro.llm_client import _extract_json
+
+    reasoning = (
+        "先看格式 {} ; 模板是 {\"report_utc\": [], \"no_report_utc\": []} ; "
+        "草稿 {\"report_utc\": [\"2026-10-04T00:15:00Z\"]} 不对 ; "
+        "最终 {\"report_utc\": [\"2026-10-02T01:30:00Z\", \"2026-10-05T02:30:00Z\"], \"notes\": \"ok\"}"
+    )
+    assert _extract_json(reasoning) == {
+        "report_utc": ["2026-10-02T01:30:00Z", "2026-10-05T02:30:00Z"], "notes": "ok"}
+    # 诚实的空答案仍然要能返回 (不能因为"没内容"就丢掉)
+    assert _extract_json('{"report_utc": []}') == {"report_utc": []}
+    # 其它环节的答案字段也要认得
+    assert _extract_json('思考... {"bad_night": true, "avoid_directions": ["SW"]}') == {
+        "bad_night": True, "avoid_directions": ["SW"]}
