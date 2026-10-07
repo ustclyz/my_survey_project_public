@@ -72,6 +72,11 @@ ALT_MARGIN_DEG = 0.6                          # keep targets this far above the 
 # --- value --------------------------------------------------------------------------------------------
 PLAN_FACTOR_SAFETY = _env("PLAN_FACTOR_SAFETY", 0.97)   # plan as if the sky were 3% worse than estimated
 REQUIRED_BONUS = _env("REQUIRED_BONUS", 80.0)  # planning value of rescuing one required target (penalty 50)
+# 必观测轮转锚点 (Hard 模式 A1-D1): 实测卡 A1 有 153/1500 个必观测**从未被观测**,
+# 都集中在赤纬 -67° 附近(中天高度仅 ~47°, 可见窗口短)。它们虽然 value 很高, 但
+# "视场中心"仍可能长期轮不到。这里显式把"未完成必观测"按失败次数从少到多轮流塞进
+# 候选中心 (先 exact() 预算好 base 表), 保证整季遍历到每一个必观测目标。
+REQUIRED_FORCE_ANCHORS = _env("REQUIRED_FORCE_ANCHORS", 4)
 REQ_P_LO = _env("REQ_P_LO", 0.95)             # P(success) ramps from 0 at this share of the needed reach ...
 REQ_P_HI = _env("REQ_P_HI", 1.35)             # ... to 1 at this share
 REQUEST_MULT = _env("REQUEST_MULT", 3.0)
@@ -812,6 +817,19 @@ class Planner:
         ranked.sort(reverse=True)
         n_anchors = (N_ANCHORS, 3, 1, 1)[min(level, 3)]
         anchors = [i for _, i in ranked[:n_anchors]]
+        if REQUIRED_FORCE_ANCHORS > 0:
+            req_open = [i for i in visible if self.required[i] and self.factor[i] < 0.5]
+            if req_open:
+                req_open.sort(key=lambda i: (self.attempts[i], -self.value(i), i))
+                forced = []
+                for i in req_open:
+                    if i in anchors or exact(i) is None:
+                        continue
+                    forced.append(i)
+                    if len(forced) >= REQUIRED_FORCE_ANCHORS:
+                        break
+                if forced:
+                    anchors = forced + anchors
         if N_DENSE and level <= 1 and bins:
             # also try the densest patches of remaining science: fields with no single outstanding target
             for _, key in heapq.nlargest(N_DENSE if level == 0 else 2, ((v, k) for k, v in bins.items())):
