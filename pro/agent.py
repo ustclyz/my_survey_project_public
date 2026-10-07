@@ -60,6 +60,31 @@ MAX_FALSE_REPORTS = 8
 # 报对 +100 且能救回大量必观测目标; 普通卡 (A-D) 的 scale 常年 0.6~1.0, 不会误触发。
 SCALE_FAULT_LEVEL = _env("SCALE_FAULT_LEVEL", 0.15)
 SCALE_FAULT_HOURS = _env("SCALE_FAULT_HOURS", 3)
+# --- 值班日志 (Hard 模式 A1-D1 的关键) -------------------------------------------------
+# A1-D1 的 observation_request.reason 里附带本站**值班日志**: 它预告"何时动导星相机"
+# —— 那一刻起所有曝光都是废片, 直到有人报修为止, 所以"到点直接报修"; 同时会写平场灯/
+# 镜盖测试时段(也是废片, 但**不是故障**, 报了算误报)。日志中英日混写, 常用凯撒密码/
+# 摩斯/唱名伪装, 还夹杂"听说/没确认/已取消/推迟/东京时间(UTC+9)"等干扰项。
+# 官方任务卡把"只看请求目标和奖励, 不读值班日志"明确列为常见错误 —— 这正是我们先前
+# A1-D1 大幅负分的原因。这里把日志原文交给模型解析成"需要报修的绝对 UTC 时刻"并排程。
+DUTY_ENABLED = _env("DUTY_ENABLED", 1)
+DUTY_MIN_CHARS = _env("DUTY_MIN_CHARS", 80)
+DUTY_REPORT_WINDOW_HOURS = _env("DUTY_REPORT_WINDOW_HOURS", 12.0)
+DUTY_SYSTEM = (
+    "你是天文台值班日志的解析助手。日志用中文/日文/英文混写, 有的句子用凯撒密码"
+    "(英文字母整体位移, 位移量常等于写那条日志当天的日期)、摩斯电码、或唱名"
+    "(do=1 re=2 mi=3 fa=4 sol=5 la=6 si=7, 高音do=8, 高音re=9, 休止=0)伪装。日志里会写:\n"
+    "1) 何时'动导星相机'(导星/导星相机/guider camera 作业): 从那一刻起所有曝光都是废片, "
+    "一直到有人报修为止 -> 必须在那个时刻报修(日志原话: '到点直接报修').\n"
+    "2) 平场灯/镜盖测试(flat-lamp/镜盖/cover test)时段: 数据也是废片, 但**不是故障**, "
+    "绝对不要报修(报了算误报)。\n"
+    "3) 干扰项: '听说的/没确认/先别当真'是传闻; '取消/不动/别报'要删掉; '推迟/延后'改成新"
+    "时间; '记错了/更正'用更正后的时间; 标明东京时间(UTC+9)的要换算。\n"
+    "我会给你日志原文(按时间先后拼接)、本站当地时间相对 UTC 的偏移小时数、当前 UTC 时间。\n"
+    "只输出一个 JSON 对象: {\"report_utc\": [\"YYYY-MM-DDTHH:MM:SSZ\", ...], \"reason\": \"<15 words>\"}。"
+    "report_utc 列出**需要报修**的绝对 UTC 时刻(包括已预告但还没报的), 不含平场灯/镜盖测试。"
+    "若没有则返回空数组。"
+)
 # The participant guide: an earthquake (announced in the bulletin) lowers instrument efficiency, the loss fades
 # night by night, and a report does not repair it. So E drops right after an earthquake are not reportable, and
 # while its effect may last only a new step down in E (a fresh drop from the preceding hours) is fault evidence.
@@ -155,6 +180,13 @@ class ObserverAgent:
         self.quake_on = False
         self.quake_onset_hours = -1e9
         self.quake_last_hours = -1e9
+        # duty log (Hard-mode A1-D1)
+        self.utc_offset_hours = float((init.get("site") or {}).get("utc_offset_hours", 0.0) or 0.0)
+        self.duty_chunks: list = []      # 新到的日志原文
+        self.duty_call = None
+        self.duty_times: list = []       # 需要报修的 UTC 时刻
+        self.duty_done: set = set()
+        self.consecutive_reports = 0
         # pace state
         self.cost_ema = [0.0, 0.0, 0.0, 0.0]     # CPU seconds per observe decision at each search level
         self.wall_ema = [0.0, 0.0, 0.0, 0.0]     # real seconds per observe decision (own turn, model waits excluded)
@@ -204,6 +236,11 @@ class ObserverAgent:
         for message in payload.get("new_messages", []):
             if message.get("record_type") == "forecast":
                 self.forecast_notices = message.get("notices", [])
+            elif message.get("record_type") == "observation_request":
+                text = str(message.get("reason") or "")
+                if DUTY_ENABLED and len(text) >= DUTY_MIN_CHARS:
+                    self.duty_chunks.append(text)
+                    self._duty_advice(payload)
         last = payload.get("last_result") or {}
         if last.get("action") == "report":
             self._on_report_result(last, hours)
@@ -240,12 +277,19 @@ class ObserverAgent:
         if planner.site_closed():
             return {"action": "wait", "duration_seconds": self._to_next_slot(now, night_start),
                     "reason": "bulletin: rain/storm over the whole sky"}
+        scheduled = self._due_report(now)
+        if scheduled is not None:
+            self.consecutive_reports += 1
+            return scheduled
         report = self._maybe_report(hours, payload)
         if report is not None:
+            self.consecutive_reports += 1
             return report
         action = planner.plan(now, night_end, night_index, hours)
         if action is None:
+            self.consecutive_reports = 0
             return {"action": "wait", "duration_seconds": self._to_next_slot(now, night_start), "reason": "nothing useful is up"}
+        self.consecutive_reports = 0
         self.observes += 1
         action["reason"] = f"{len(action['assignments'])} fibres, program {action['program']}"
         return action
@@ -490,6 +534,63 @@ class ObserverAgent:
             if self.false_since_correct > self.free_allowance:
                 self.paid_false += 1
             log(f"pro: report false (delta {result.get('score_delta')}); free left {self.free_left()}")
+
+
+    # --- 值班日志排程 (Hard-mode A1-D1) ----------------------------------------------------------
+
+    def _duty_advice(self, payload: dict) -> None:
+        """把新到的值班日志交给模型, 解析出"需要报修的绝对 UTC 时刻" (后台线程, 不阻塞决策)."""
+        if self.client is None:
+            self.duty_chunks = []
+            return
+        if self.duty_call is not None:
+            if not self.duty_call.done():
+                return                      # 上一次还没回来: 先攒着, 下轮再发
+            self._apply_duty(self.client.collect(self.duty_call))
+            self.duty_call = None
+        text = "\n\n".join(self.duty_chunks[-4:])   # 只发最近几条, 控制 token
+        user = {
+            "task": "解析值班日志, 给出必须报修的绝对 UTC 时刻",
+            "local_utc_offset_hours": self.utc_offset_hours,
+            "now_utc": payload.get("now_utc"),
+            "duty_log": text,
+        }
+        started = time.monotonic()
+        self.duty_call = self.client.submit("duty_log", DUTY_SYSTEM, user, self._clock(payload)[1])
+        self.model_wait += time.monotonic() - started
+        self.duty_chunks = []
+
+    def _apply_duty(self, answer) -> None:
+        if not isinstance(answer, dict):
+            return
+        times = answer.get("report_utc")
+        if not isinstance(times, list):
+            return
+        for item in times:
+            try:
+                moment = parse_utc(str(item))
+            except (ValueError, TypeError):
+                continue                    # 模型给的时刻格式非法: 丢弃
+            if moment is None or moment in self.duty_done:
+                continue
+            if moment in self.duty_times:
+                continue
+            self.duty_times.append(moment)
+            log(f"pro: duty log -> scheduled fault report at {format_utc(moment)}")
+        self.duty_times.sort()
+
+    def _due_report(self, now):
+        """到点的排程报修. 连续 report 不能超过平台上限 (32), 所以每报 3 次先做点别的."""
+        if not self.duty_times or self.client is None or self.consecutive_reports >= 3:
+            return None
+        for moment in self.duty_times:
+            if moment in self.duty_done:
+                continue
+            if moment <= now and (now - moment).total_seconds() <= DUTY_REPORT_WINDOW_HOURS * 3600.0:
+                self.duty_done.add(moment)
+                log(f"pro: duty-log report at {format_utc(now)} (scheduled {format_utc(moment)})")
+                return {"action": "report", "reason": "duty log: guider camera fault"}
+        return None
 
 
 def main() -> int:
