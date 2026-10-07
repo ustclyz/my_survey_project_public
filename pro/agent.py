@@ -261,6 +261,7 @@ class ObserverAgent:
         self.duty_bad_nights: set = set()
         self.duty_updates = 0
         self.duty_simple = False         # 当前在飞的是否为"降级重试"
+        self._duty_last_text = ""        # 最近一次送出的日志原文 (答案为空时用它降级重问)
         self.consecutive_reports = 0
         self._hours_now = 0.0            # 模拟小时数 (由 _respond 更新; 供现场态势快照使用)
         # Hard 模式 (A1-D1) 才需要"绝对质量下限"这条激进判据: 那些卡有值班日志预告的导星相机
@@ -709,7 +710,13 @@ class ObserverAgent:
                 else:
                     self.duty_history.append({"role": "assistant",
                                               "content": json.dumps(answer, ensure_ascii=False, separators=(",", ":"))})
-                    self._apply_duty(answer)
+                    found = self._apply_duty(answer)
+                    # 全量答案"空的"时不要就此认输: 模型(如 deepseek-flash)可能压根没从密文日志
+                    # 里读出时刻。用更聚焦的极简提示把同一段日志再问一次 (只问报修时刻)。
+                    if DUTY_SIMPLE_RETRY and found == 0 and self._duty_last_text:
+                        self.duty_pending = [{"issued_at_utc": None, "duty_log": self._duty_last_text}]
+                        self._duty_simple(payload)
+                        return
         if not self.duty_pending:
             return
         turn = {
@@ -718,6 +725,7 @@ class ObserverAgent:
             "issued_now_utc": payload.get("now_utc"),
             "run_state": self._run_state_snapshot(payload),
         }
+        self._duty_last_text = turn["duty_log"]
         self.duty_history.append({"role": "user",
                                   "content": json.dumps(turn, ensure_ascii=False, separators=(",", ":"))})
         self._trim_duty_history()
@@ -804,10 +812,10 @@ class ObserverAgent:
         except (ValueError, TypeError):
             return None
 
-    def _apply_duty(self, answer) -> None:
-        """采用模型给出的**全量**状态, 并把它接进规划器与报修逻辑."""
+    def _apply_duty(self, answer) -> int:
+        """采用模型给出的**全量**状态, 并把它接进规划器与报修逻辑。返回排程到的报修时刻数。"""
         if not isinstance(answer, dict):
-            return
+            return 0
         self.duty_state = answer
         self.duty_updates += 1
         times = sorted({m for m in (self._duty_time(x) for x in (answer.get("report_utc") or [])) if m})
@@ -864,6 +872,7 @@ class ObserverAgent:
             f"prefer={self.planner.llm_prefer} boost={len(self.planner.llm_target_boost)} "
             f"dur={self.planner.llm_duration_scale} lam={self.planner.llm_lambda_scale} "
             f"notes={str(answer.get('notes') or '')[:80]!r}")
+        return len(self.duty_times)
 
     def _in_no_report_window(self, now) -> bool:
         """当前是否落在值班日志点名的"废片但不是故障"窗口里 (平场灯/镜盖测试)."""

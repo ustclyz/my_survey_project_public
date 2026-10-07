@@ -271,6 +271,9 @@ class LLMClient:
                 merged = list(dict.fromkeys([*salvaged, *(parsed.get("report_utc") or [])]))
                 parsed = {**parsed, "report_utc": merged}
                 self.log(f"llm: 回复被截断, 从原文抢救出 {len(salvaged)} 个报修时刻")
+            elif "report_utc" in parsed:
+                # 模型明确给了空列表: 打出原文前 300 字, 判断是"真没有"还是"没读懂日志"
+                self.log(f"llm: report_utc 为空, 原文前 300 字: {raw[:300]!r}")
         return parsed
 
     def in_flight(self) -> int:
