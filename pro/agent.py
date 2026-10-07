@@ -76,6 +76,9 @@ DUTY_REPORT_WINDOW_HOURS = _env("DUTY_REPORT_WINDOW_HOURS", 12.0)
 DUTY_HISTORY_CHARS = _env("DUTY_HISTORY_CHARS", 40000)   # 多轮历史的总字符预算
 DUTY_NO_REPORT_HOURS = _env("DUTY_NO_REPORT_HOURS", 1.0)  # 平场灯/镜盖测试窗口的半宽
 DUTY_REPORT_MIN_LIKELY = _env("DUTY_REPORT_MIN_LIKELY", 0.5)  # 采纳"立即报修"所需的最低把握度
+# 值班日志要解密(凯撒/摩斯/唱名)并输出全量状态, 2000 token 会被推理吃光导致 content 为空/截断
+# (实测 v10/v11 共 55 次调用 100% 失败) —— 这里给它单独放大输出预算。
+DUTY_MAX_TOKENS = _env("DUTY_MAX_TOKENS", 6000)
 DUTY_SYSTEM = """你是天文台的值班助手, 负责把站里的【值班日志】变成可执行的运行决策。
 日志用中文/日文/英文混写; 有的句子用凯撒密码(英文字母整体位移, 位移量常等于写那条日志当天的日期)、
 摩斯电码、唱名(do=1 re=2 mi=3 fa=4 sol=5 la=6 si=7, 高音do=8, 高音re=9, 休止=0)伪装。
@@ -644,7 +647,8 @@ class ObserverAgent:
         self._trim_duty_history()
         messages = [{"role": "system", "content": DUTY_SYSTEM}] + self.duty_history
         started = time.monotonic()
-        call = self.client.submit_messages("duty_log", messages, self._clock(payload)[1])
+        call = self.client.submit_messages("duty_log", messages, self._clock(payload)[1],
+                                           max_tokens=DUTY_MAX_TOKENS)
         self.model_wait += time.monotonic() - started
         if call is None:
             self.duty_history.pop()         # 预算不允许: 撤轮, 下轮重试 (duty_pending 保留)

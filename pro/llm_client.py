@@ -131,20 +131,20 @@ def load_dotenv(path: str) -> None:
 class Call:
     """One background chat completion."""
 
-    def __init__(self, client: "LLMClient", tag: str, messages: list, timeout: float):
+    def __init__(self, client: "LLMClient", tag: str, messages: list, timeout: float, max_tokens: int):
         self.tag = tag
         self.answer = None
         self.error = None
         self.seconds = 0.0
         self._done = threading.Event()
-        self._thread = threading.Thread(target=self._run, args=(client, messages, timeout), daemon=True)
+        self._thread = threading.Thread(target=self._run, args=(client, messages, timeout, max_tokens), daemon=True)
         self._thread.start()
 
-    def _run(self, client, messages, timeout) -> None:
+    def _run(self, client, messages, timeout, max_tokens) -> None:
         started = time.monotonic()
         for attempt in range(client.max_retries):
             try:
-                self.answer = client._request(messages, timeout)
+                self.answer = client._request(messages, timeout, max_tokens)
                 self.error = None
                 break
             except (urllib.error.URLError, OSError, ValueError, KeyError, IndexError, TypeError) as exc:
@@ -164,20 +164,22 @@ class Call:
 
 class LLMClient:
     def __init__(self, log=lambda text: None, call_timeout: float = 90.0, max_calls: int = 1500,
-                 max_retries: int = 3, max_in_flight: int = 4):
+                 max_retries: int = 3, max_in_flight: int = 4, max_tokens: int = 2000):
         self.log = log
         self.key, self.base_url, self.model = _credentials()
         self.call_timeout = call_timeout
         self.max_calls = max_calls
         self.max_retries = max_retries
         self.max_in_flight = max_in_flight
+        self.max_tokens = max_tokens
         self.calls: list[Call] = []
         self.ok = 0
         self.failed = 0
 
-    def _request(self, messages: list, timeout: float) -> dict:
+    def _request(self, messages: list, timeout: float, max_tokens: int = None) -> dict:
         """把完整的 messages 数组 (含 system / 历史 user+assistant 轮) 发给 /chat/completions."""
-        body = json.dumps({"model": self.model, "messages": messages, "max_tokens": 2000}).encode("utf-8")
+        body = json.dumps({"model": self.model, "messages": messages,
+                           "max_tokens": int(max_tokens or self.max_tokens)}).encode("utf-8")
         request = urllib.request.Request(self.base_url + "/chat/completions", data=body, method="POST",
                                          headers={"Content-Type": "application/json",
                                                   "Authorization": "Bearer " + self.key})
@@ -189,18 +191,21 @@ class LLMClient:
             # 推理型模型可能把答案放在 reasoning_content, content 为空
             parsed = _extract_json(message.get("reasoning_content") or "")
         if parsed is None:
+            # 失败时把原始回复(截断)打到 stderr: 这是排查"模型到底回了什么"的唯一线索
+            raw = (message.get("content") or "") or (message.get("reasoning_content") or "")
+            self.log(f"llm: 回复里没有 JSON, 原文前 400 字: {raw[:400]!r}")
             raise ValueError("no JSON object in the reply")
         return parsed
 
     def in_flight(self) -> int:
         return sum(1 for call in self.calls if not call.done())
 
-    def submit_messages(self, tag: str, messages: list, wallclock_left: float):
+    def submit_messages(self, tag: str, messages: list, wallclock_left: float, max_tokens: int = None):
         """Start a background call with a **full message array** (system + 多轮历史). None if limits say no."""
         timeout = min(self.call_timeout, wallclock_left - 30.0)
         if len(self.calls) >= self.max_calls or timeout < 5.0 or self.in_flight() >= self.max_in_flight:
             return None
-        call = Call(self, tag, messages, timeout)
+        call = Call(self, tag, messages, timeout, int(max_tokens or self.max_tokens))
         self.calls.append(call)
         return call
 

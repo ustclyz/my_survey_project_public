@@ -45,7 +45,7 @@ class _StubClient:
         self.requests: list = []
         self.n_users = 0
 
-    def submit_messages(self, tag, messages, wallclock_left):
+    def submit_messages(self, tag, messages, wallclock_left, max_tokens=None):
         self.requests.append(messages)
         self.n_users += sum(1 for m in messages if m["role"] == "user")
         answer = {"report_utc": ["2026-10-02T01:30:00Z"],

@@ -155,7 +155,7 @@ class _RecordingClient:
         self.ok = 0
         self.failed = 0
 
-    def submit_messages(self, tag, messages, wallclock_left):
+    def submit_messages(self, tag, messages, wallclock_left, max_tokens=None):
         self.requests.append(messages)
         return _FakeCall(self.answers.pop(0) if self.answers else None)
 
@@ -294,6 +294,35 @@ def test_llm_client_builds_multi_turn_request():
         urllib.request.urlopen = original
     assert out == {"a": 1}
     assert [m["role"] for m in captured["body"]["messages"]] == ["system", "user", "assistant", "user"]
+
+
+def test_llm_client_honours_per_call_max_tokens():
+    """值班日志调用要能单独放大 max_tokens (默认 2000 会被推理吃光)."""
+    import urllib.request
+    from pro.llm_client import LLMClient
+
+    client = LLMClient(log=lambda *_: None)
+    captured = {}
+
+    class _Resp:
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": "{\"ok\": 1}"}}]}).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    original = urllib.request.urlopen
+    urllib.request.urlopen = lambda request, timeout=None: (captured.update(
+        body=json.loads(request.data.decode("utf-8"))) or _Resp())
+    try:
+        client._request([{"role": "user", "content": "x"}], 10.0, 6000)
+    finally:
+        urllib.request.urlopen = original
+    assert captured["body"]["max_tokens"] == 6000
+    assert client.max_tokens == 2000          # 默认值不受影响
 
 
 def test_duty_history_is_trimmed_but_state_survives():
