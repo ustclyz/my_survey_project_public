@@ -54,7 +54,12 @@ E_PAID_STEP = _env("E_PAID_STEP", 0.05)   # ... minus this per paid false probe 
 # 8 会在"快速报修"下过早撞顶: 实测 v6 在卡 A1 已用掉 7 次误报, 一旦到 8 次就**永久
 # 停止报修** -> 后面所有真故障都无法修复, 直接灾难。误报在每次报对后的免罚额度内是
 # 免费的 (free_allowance=2), 只有超出的才 -150, 所以放宽总次数上限是安全的。
-MAX_FALSE_REPORTS = 40
+# 绝对质量下限判据会把"真故障"和"全场坏天"一起判为可疑, 报修频率上升到"每次故障一次"
+# (A1 实测约 1 次/夜, 约 100+ 次). 免罚额度 = 2 x 报对次数, 所以误报总数上限必须放宽,
+# 否则一旦撞顶就**永久停报** -> 后面的真故障全部无法修复 (灾难)。这里设成一个只防失控的
+# 保险丝, 而不是主要节流阀。
+MAX_FALSE_REPORTS = _env("MAX_FALSE_REPORTS", 150)
+SCALE_FAULT_BLOCK_KINDS = {"rain", "storm", "overcast"}   # 公告全场下雨/厚云: 质量低是天气, 不判故障
 # 绝对质量下限的故障判据 (Hard 模式卡的关键). 官方 pro 的 E = 质量/档位 判据在"档位
 # 估计跟着质量一起塌缩"时会失效 (E 恒为 ~1), 仪器故障就长期发现不了。实测卡 A1:
 # 首夜后质量从 Q~0.6 崩到 ~0.004 并持续 100+ 夜, 而 agent 只报修 3 次 (间隔约 30 夜),
@@ -466,12 +471,27 @@ class ObserverAgent:
             return {"action": "report", "reason": "quality level below what the program bands allow"}
         return None
 
+    def _scale_fault_blocked(self) -> bool:
+        """公告说全场下雨/厚云: 质量塌陷可以用天气解释, 这时不判故障。"""
+        notices = getattr(self.planner, "notices", ())
+        return any(direction == "ALL" and kind in SCALE_FAULT_BLOCK_KINDS for kind, direction in notices)
+
     def _fault_verdict(self, hours: float, payload: dict) -> bool:
         """Hourly E = quality level / band level (planner.e_hours). 1 = consistent; a fault keeps E low."""
         rows = [(hour, night, sorted(v)[len(v) // 2]) for hour, night, v in self.planner.e_hours if hour >= self.ref_from_hours]
         if rows and int(hours) != getattr(self, "_logged_hour", None):
             self._logged_hour = int(hours)
             log(f"pro: E {payload['now_utc']} {rows[-1][2]:.2f} scale {self.planner.scale:.3f} band {self.planner.band_level or 0:.3f}")
+        # 绝对判据必须放在 E 表新鲜度检查**之前**。E 表只在命中分数能对上某个 program 倍率时
+        # 才更新 (planner.band_obs); 导星相机故障会把分数压到 ~0.05x, 对不上任何倍率, 于是
+        # E 表在故障开始两小时后就不再更新 -> 下面的 "rows 过期" 早退会把报修永久锁死。
+        # 实测 A1: 2026-11-14 起质量塌到 0.05, 之后 25 天一次都没报修, 近 90 夜数据全废。
+        if self._scale_fault(hours):
+            if self._scale_fault_blocked():
+                return False
+            log(f"pro: scale {self.planner.scale:.3f} < {SCALE_FAULT_LEVEL} for {SCALE_FAULT_HOURS}h "
+                f"-> instrument fault suspected")
+            return True
         if len(rows) < E_FREE_HOURS or rows[-1][0] < int(hours) - 1:
             return False
         if QUAKE_STEP > 0 and hours - self.quake_last_hours < QUAKE_TAIL_HOURS:
@@ -494,10 +514,6 @@ class ObserverAgent:
                 self.episode_blocked = False   # 灾难性低质量是新情况: 允许再探一次
             else:
                 return False
-        if self._scale_fault(hours):
-            log(f"pro: scale {self.planner.scale:.3f} < {SCALE_FAULT_LEVEL} for {SCALE_FAULT_HOURS}h "
-                f"-> instrument fault suspected")
-            return True
         likely = self.fault_likely
         if MODEL_FREE_PROBE and likely is not None and likely >= MODEL_FAULT_HIGH and self.free_left() > 0 and self._scale_step(hours):
             # off by default: on the practice cards it spent free probes on unannounced weather
