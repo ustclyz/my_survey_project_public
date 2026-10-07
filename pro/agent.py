@@ -29,6 +29,7 @@ from datetime import timedelta
 
 from pro.advisor import Advisor
 from pro.llm_client import LLMClient, api_key, load_dotenv
+from pro.maintenance import MaintenanceSchedule
 from pro.planner import DIRECTION_AZ, Planner
 from pro.skymath import format_utc, parse_utc
 
@@ -262,6 +263,12 @@ class ObserverAgent:
         self.duty_done: set = set()
         self.duty_no_report: list = []   # "废片但不是故障"的窗口中心 (UTC)
         self.duty_bad_nights: set = set()
+        # 确定性维护排程 (移植自 rescue v3 的 pro/maintenance.py): 只采信"工程通知"里显式的
+        # "到点报修 / 推迟 N 小时 / 取消", 与 LLM 的解析结果走同一条 duty_times 合并通道;
+        # 两边互为增益: LLM 可以补充、纠正或取消它, 它也可以在 LLM 失败时独立兜底。
+        self.maintenance = MaintenanceSchedule(self.utc_offset_hours)
+        self.duty_cancelled: set = set()
+        self.duty_test_windows: set = set()
         self.duty_updates = 0
         self.duty_simple = False         # 当前在飞的是否为"降级重试"
         self._duty_last_text = ""        # 最近一次送出的日志原文 (答案为空时用它降级重问)
@@ -329,6 +336,11 @@ class ObserverAgent:
                     self.hard_mode = True   # 值班日志只出现在 Hard 模式卡 (A1-D1)
                     self.duty_pending.append({"issued_at_utc": message.get("issued_at_utc"), "duty_log": text})
                     self._duty_tick(payload)
+        if DUTY_ENABLED and any(m.get("record_type") == "observation_request"
+                                for m in payload.get("new_messages", [])):
+            # 确定性解析器先跑: 它认出的是"工程通知里写死的绝对时刻", 与模型答案合并
+            self.maintenance.ingest(payload.get("new_messages", []))
+            self._apply_maintenance()
         last = payload.get("last_result") or {}
         if last.get("action") == "report":
             self._on_report_result(last, hours)
@@ -372,6 +384,12 @@ class ObserverAgent:
         if scheduled is not None:
             self.consecutive_reports += 1
             return scheduled
+        # 值班日志预告的平场灯/镜盖测试窗口: 那段是废片, 既不能观测也别误判成故障报修
+        test_end = max((end for start, end in self.duty_test_windows if start <= now < end), default=None)
+        if test_end is not None:
+            self.consecutive_reports = 0
+            return {"action": "wait", "until_utc": format_utc(test_end),
+                    "reason": "duty log: scheduled flat/cap test; neither observe nor report"}
         report = self._maybe_report(hours, payload)
         if report is not None:
             self.consecutive_reports += 1
@@ -819,14 +837,51 @@ class ObserverAgent:
         except (ValueError, TypeError):
             return None
 
+    def _apply_maintenance(self) -> None:
+        """把确定性解析器的结果并进排程 (与模型输出同一条 duty_times 通道, 幂等)."""
+        if self.maintenance is None:
+            return
+        added = 0
+        for moment in sorted(self.maintenance.faults):
+            if moment in self.duty_done or moment in self.duty_cancelled or moment in self.duty_times:
+                continue
+            self.duty_times.append(moment)
+            added += 1
+            log(f"pro: duty log(确定性) -> scheduled fault report at {format_utc(moment)}")
+        before = len(self.duty_times)
+        if self.maintenance.cancelled:
+            self.duty_cancelled |= set(self.maintenance.cancelled)
+            self.duty_times = [t for t in self.duty_times if t not in self.duty_cancelled]
+        self.duty_times.sort()
+        for start, end in self.maintenance.tests:
+            self.duty_test_windows.add((start, end))
+        if added or before != len(self.duty_times):
+            log(f"pro: duty log(确定性): 排程 {len(self.duty_times)} 个报修时刻, "
+                f"测试窗口 {len(self.duty_test_windows)} 个, 取消 {len(self.duty_cancelled)} 个")
+
     def _apply_duty(self, answer) -> int:
         """采用模型给出的**全量**状态, 并把它接进规划器与报修逻辑。返回排程到的报修时刻数。"""
         if not isinstance(answer, dict):
             return 0
         self.duty_state = answer
         self.duty_updates += 1
+        # 模型给出的"取消 / 测试窗口"也接进同一条通道 (模型有否决确定性解析的余地)
+        for item in (answer.get("cancelled_utc") or []):
+            moment = self._duty_time(item)
+            if moment is not None:
+                self.duty_cancelled.add(moment)
+        for window in (answer.get("test_windows_utc") or []):
+            if not isinstance(window, dict):
+                continue
+            start = self._duty_time(window.get("start_utc"))
+            end = self._duty_time(window.get("end_utc"))
+            if start and end and start < end and (end - start).total_seconds() <= 14400:
+                self.duty_test_windows.add((start, end))
         times = sorted({m for m in (self._duty_time(x) for x in (answer.get("report_utc") or [])) if m})
-        self.duty_times = [t for t in times if t not in self.duty_done]
+        # 确定性解析到的时刻不能被模型的"全量状态"抹掉 (除非模型明确取消它)
+        times = sorted(set(times) | set(self.maintenance.faults))
+        self.duty_times = [t for t in times
+                           if t not in self.duty_done and t not in self.duty_cancelled]
         self.duty_no_report = [m for m in (self._duty_time(x) for x in (answer.get("no_report_utc") or [])) if m]
         self.duty_bad_nights = {str(x)[:10] for x in (answer.get("bad_nights") or []) if str(x).strip()}
         # 方向性规避 (风大关闭 / 发射窗口封锁 / 日志点名的方位)
@@ -905,13 +960,14 @@ class ObserverAgent:
 
     def _due_report(self, now):
         """到点的排程报修. 连续 report 不能超过平台上限 (32), 所以每报 3 次先做点别的."""
-        if not self.duty_times or self.client is None or self.consecutive_reports >= 3:
+        if not self.duty_times or self.consecutive_reports >= 3:
             return None
         for moment in self.duty_times:
             if moment in self.duty_done:
                 continue
             if moment <= now and (now - moment).total_seconds() <= DUTY_REPORT_WINDOW_HOURS * 3600.0:
-                self.duty_done.add(moment)
+                # 一次 report 就修好当前故障; 同一时刻的多个逾期排程不该各报一次
+                self.duty_done.update(t for t in self.duty_times if t <= now)
                 log(f"pro: duty-log report at {format_utc(now)} (scheduled {format_utc(moment)})")
                 return {"action": "report", "reason": "duty log: guider camera fault"}
         return None
