@@ -89,6 +89,10 @@ def load_dotenv(path: str) -> None:
         pass
 
 
+class ReplyError(ValueError):
+    """Safe structural diagnostics; never includes response text or credentials."""
+
+
 class Call:
     """One background chat completion."""
 
@@ -109,7 +113,7 @@ class Call:
                 self.error = None
                 break
             except (urllib.error.URLError, OSError, ValueError, KeyError, IndexError, TypeError) as exc:
-                self.error = type(exc).__name__
+                self.error = (str(exc) if isinstance(exc, ReplyError) else type(exc).__name__)
                 if time.monotonic() - started > timeout:
                     break
                 time.sleep(1.0 + attempt)
@@ -141,21 +145,39 @@ class LLMClient:
             "model": self.model,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": json.dumps(user, separators=(",", ":"))}],
-            "max_tokens": 2000,
+            "max_tokens": int(os.environ.get("PRO_LLM_MAX_TOKENS", "8192")),
         }).encode("utf-8")
         request = urllib.request.Request(self.base_url + "/chat/completions", data=body, method="POST",
                                          headers={"Content-Type": "application/json",
                                                   "Authorization": "Bearer " + self.key})
         with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
-        text = data["choices"][0]["message"]["content"] or ""
-        match = _JSON_OBJECT.search(text)
-        if not match:
-            raise ValueError("no JSON object in the reply")
-        parsed = json.loads(match.group(0))
-        if not isinstance(parsed, dict):
-            raise ValueError("reply is not a JSON object")
-        return parsed
+        choice = data["choices"][0]
+        text = choice["message"].get("content") or ""
+        if choice.get("finish_reason") == "length":
+            raise ReplyError("truncated_reply")
+        if not isinstance(text, str) or not text.strip():
+            raise ReplyError("empty_content")
+        # Read a complete object instead of greedily joining unrelated braces.
+        # Reject ambiguous replies containing more than one complete object.
+        decoder = json.JSONDecoder()
+        objects = []
+        pos = 0
+        while pos < len(text):
+            start = text.find("{", pos)
+            if start < 0:
+                break
+            try:
+                parsed, end = decoder.raw_decode(text, start)
+            except ValueError:
+                pos = start + 1
+                continue
+            if isinstance(parsed, dict):
+                objects.append(parsed)
+            pos = end
+        if len(objects) != 1:
+            raise ReplyError("missing_or_ambiguous_json")
+        return objects[0]
 
     def in_flight(self) -> int:
         return sum(1 for call in self.calls if not call.done())

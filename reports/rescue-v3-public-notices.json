@@ -1,0 +1,22 @@
+{
+  "A1": {
+    "explicit_fault_times": 92,
+    "test_windows": 290,
+    "cancelled_times": 15
+  },
+  "B1": {
+    "explicit_fault_times": 113,
+    "test_windows": 363,
+    "cancelled_times": 15
+  },
+  "C1": {
+    "explicit_fault_times": 39,
+    "test_windows": 143,
+    "cancelled_times": 10
+  },
+  "D1": {
+    "explicit_fault_times": 163,
+    "test_windows": 501,
+    "cancelled_times": 14
+  }
+}

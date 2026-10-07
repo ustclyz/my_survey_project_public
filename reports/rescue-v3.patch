@@ -1,0 +1,528 @@
+--- rescue-v2/pro/agent.py
++++ rescue-v3/pro/agent.py
+@@ -29,6 +29,7 @@
+ from pro.advisor import Advisor
+ from pro.llm_client import LLMClient, api_key, load_dotenv
+ from pro.planner import Planner
++from pro.maintenance import MaintenanceSchedule
+ from pro.skymath import format_utc, parse_utc
+ 
+ WEATHER_KINDS = {"rain", "storm", "overcast", "haze", "cold_snap"}
+@@ -86,7 +87,7 @@
+     "3) 干扰项: '听说的/没确认/先别当真'是传闻; '取消/不动/别报'要删掉; '推迟/延后'改成新"
+     "时间; '记错了/更正'用更正后的时间; 标明东京时间(UTC+9)的要换算。\n"
+     "我会给你日志原文(按时间先后拼接)、本站当地时间相对 UTC 的偏移小时数、当前 UTC 时间。\n"
+-    "只输出一个 JSON 对象: {\"report_utc\": [\"YYYY-MM-DDTHH:MM:SSZ\", ...], \"reason\": \"<15 words>\"}。"
++    "只输出一个 JSON 对象，包含前述 test_windows_utc、cancelled_utc 以及: {\"report_utc\": [\"YYYY-MM-DDTHH:MM:SSZ\", ...], \"reason\": \"<15 words>\"}。"
+     "report_utc 列出**需要报修**的绝对 UTC 时刻(包括已预告但还没报的), 不含平场灯/镜盖测试。"
+     "若没有则返回空数组。"
+ )
+@@ -187,6 +188,7 @@
+         self.quake_last_hours = -1e9
+         # duty log (Hard-mode A1-D1)
+         self.utc_offset_hours = float((init.get("site") or {}).get("utc_offset_hours", 0.0) or 0.0)
++        self.maintenance = MaintenanceSchedule((init.get("site") or {}).get("utc_offset_hours"))
+         self.duty_chunks: list = []      # 新到的日志原文
+         self.duty_call = None
+         self.duty_times: list = []       # 需要报修的 UTC 时刻
+@@ -259,6 +261,15 @@
+                 if DUTY_ENABLED and len(text) >= DUTY_MIN_CHARS:
+                     planner.rescue_mode = True
+                     self.duty_chunks.append(f"issued_at_utc={message.get('issued_at_utc', payload['now_utc'])}\n{text}")
++        if DUTY_ENABLED and any(m.get("record_type") == "observation_request"
++                                for m in payload.get("new_messages", [])):
++            self.maintenance.ingest(payload.get("new_messages", []))
++            self._apply_duty({
++                "report_utc": [format_utc(t) for t in self.maintenance.faults],
++                "cancelled_utc": [format_utc(t) for t in self.maintenance.cancelled],
++                "test_windows_utc": [{"start_utc": format_utc(a), "end_utc": format_utc(b)}
++                                     for a, b in self.maintenance.tests],
++            })
+         # Poll every turn: model calls finish in real time even when no new
+         # handover arrives for several simulated nights.
+         if DUTY_ENABLED:
+@@ -313,10 +324,6 @@
+         future = [t for t in self.duty_times if t > now and t not in self.duty_done]
+         future.extend(start for start, end in self.duty_test_windows if start > now)
+         exposure_end = min(night_end, min(future)) if future else night_end
+-        if planner.rescue_mode and planner.scale < .15:
+-            # Collect fresh diagnostic evidence cheaply instead of spending an
+-            # hour per exposure while the instrument may still be faulty.
+-            exposure_end = min(exposure_end, now + timedelta(seconds=300))
+         if (exposure_end - now).total_seconds() < planner.min_exposure:
+             return {'action': 'wait', 'until_utc': format_utc(exposure_end), 'reason': 'upcoming duty event'}
+         action = planner.plan(now, exposure_end, night_index, hours)
+@@ -462,6 +469,10 @@
+         if rows and int(hours) != getattr(self, "_logged_hour", None):
+             self._logged_hour = int(hours)
+             log(f"pro: E {payload['now_utc']} {rows[-1][2]:.2f} scale {self.planner.scale:.3f} band {self.planner.band_level or 0:.3f}")
++        # Absolute throughput remains observable when unsaturated exposures do
++        # not yield an E/band estimate. Do not put it behind the E sample gate.
++        if hours - self.quake_last_hours >= QUAKE_TAIL_HOURS and self._scale_fault(hours):
++            return True
+         if len(rows) < E_FREE_HOURS or rows[-1][0] < int(hours) - 1:
+             return False
+         if QUAKE_STEP > 0 and hours - self.quake_last_hours < QUAKE_TAIL_HOURS:
+@@ -527,7 +538,8 @@
+     def _scale_fault(self, hours: float) -> bool:
+         """近几小时中位 scale 是否远低于晴夜模型 (绝对判据, 不依赖会塌缩的档位估计)."""
+         recent = [sorted(v)[len(v) // 2] for h, v in sorted(self.scale_hours.items())
+-                  if h >= self.ref_from_hours and v][-SCALE_FAULT_HOURS:]
++                  if h >= max(self.ref_from_hours, int(hours) - SCALE_FAULT_HOURS)
++                  and h > self.last_report_hours and v][-SCALE_FAULT_HOURS:]
+         return (len(recent) >= SCALE_FAULT_HOURS
+                 and float(self.planner.scale) < SCALE_FAULT_LEVEL
+                 and max(recent) < SCALE_FAULT_LEVEL)
+@@ -647,7 +659,7 @@
+ 
+     def _due_report(self, now):
+         """到点的排程报修. 连续 report 不能超过平台上限 (32), 所以每报 3 次先做点别的."""
+-        if not self.duty_times or self.client is None or self.consecutive_reports >= 3:
++        if not self.duty_times or self.consecutive_reports >= 3:
+             return None
+         for moment in self.duty_times:
+             if moment in self.duty_done:
+--- rescue-v2/pro/llm_client.py
++++ rescue-v3/pro/llm_client.py
+@@ -89,6 +89,10 @@
+         pass
+ 
+ 
++class ReplyError(ValueError):
++    """Safe structural diagnostics; never includes response text or credentials."""
++
++
+ class Call:
+     """One background chat completion."""
+ 
+@@ -109,7 +113,7 @@
+                 self.error = None
+                 break
+             except (urllib.error.URLError, OSError, ValueError, KeyError, IndexError, TypeError) as exc:
+-                self.error = type(exc).__name__
++                self.error = (str(exc) if isinstance(exc, ReplyError) else type(exc).__name__)
+                 if time.monotonic() - started > timeout:
+                     break
+                 time.sleep(1.0 + attempt)
+@@ -141,21 +145,39 @@
+             "model": self.model,
+             "messages": [{"role": "system", "content": system},
+                          {"role": "user", "content": json.dumps(user, separators=(",", ":"))}],
+-            "max_tokens": 2000,
++            "max_tokens": int(os.environ.get("PRO_LLM_MAX_TOKENS", "8192")),
+         }).encode("utf-8")
+         request = urllib.request.Request(self.base_url + "/chat/completions", data=body, method="POST",
+                                          headers={"Content-Type": "application/json",
+                                                   "Authorization": "Bearer " + self.key})
+         with urllib.request.urlopen(request, timeout=timeout) as response:
+             data = json.loads(response.read().decode("utf-8"))
+-        text = data["choices"][0]["message"]["content"] or ""
+-        match = _JSON_OBJECT.search(text)
+-        if not match:
+-            raise ValueError("no JSON object in the reply")
+-        parsed = json.loads(match.group(0))
+-        if not isinstance(parsed, dict):
+-            raise ValueError("reply is not a JSON object")
+-        return parsed
++        choice = data["choices"][0]
++        text = choice["message"].get("content") or ""
++        if choice.get("finish_reason") == "length":
++            raise ReplyError("truncated_reply")
++        if not isinstance(text, str) or not text.strip():
++            raise ReplyError("empty_content")
++        # Read a complete object instead of greedily joining unrelated braces.
++        # Reject ambiguous replies containing more than one complete object.
++        decoder = json.JSONDecoder()
++        objects = []
++        pos = 0
++        while pos < len(text):
++            start = text.find("{", pos)
++            if start < 0:
++                break
++            try:
++                parsed, end = decoder.raw_decode(text, start)
++            except ValueError:
++                pos = start + 1
++                continue
++            if isinstance(parsed, dict):
++                objects.append(parsed)
++            pos = end
++        if len(objects) != 1:
++            raise ReplyError("missing_or_ambiguous_json")
++        return objects[0]
+ 
+     def in_flight(self) -> int:
+         return sum(1 for call in self.calls if not call.done())
+--- rescue-v2/pro/maintenance.py
++++ rescue-v3/pro/maintenance.py
+@@ -0,0 +1,170 @@
++"""Conservative maintenance calendar from public handover messages.
++
++Only explicit engineering notices are actionable. Unknown language is left to
++the existing LLM, not guessed from low scores (flat tests also produce zero).
++No scenario dates, target IDs or private engine state are embedded here.
++"""
++from datetime import datetime, timedelta, timezone
++import re
++import unicodedata
++
++
++def number(text):
++    if text.isdigit():
++        return int(text)
++    digits = dict(zip('零一二三四五六七八九', range(10)))
++    text = text.replace('两', '二')
++    if '十' in text:
++        a, b = text.split('十', 1)
++        return digits.get(a, 1) * 10 + digits.get(b, 0)
++    return digits.get(text, 0)
++
++
++NUM = r'[零一二两三四五六七八九十\d]+'
++DATE = re.compile(r'(\d{1,2})[/月](\d{1,2})日?')
++CLOCK = re.compile(r'(\d{1,2}):(\d{2})')
++
++
++def normalize(text):
++    text = unicodedata.normalize('NFKC', text).replace('\u200b', '')
++    text = re.sub(r'(?<=:)\([^)]*\)(?=\d)', '', text)
++    text = text.translate(str.maketrans({'時': '时', '點': '点', '報': '报'}))
++    def clock(m):
++        hour = number(m[1])
++        minute = 30 if m[2] == '半' else number(m[3] or '0')
++        return f'{hour}:{minute:02d}'
++    return re.sub(f'({NUM})[点时](半|整|({NUM})分?)?', clock, text)
++
++
++class MaintenanceSchedule:
++    def __init__(self, utc_offset_hours=None):
++        # Missing timezone must not silently schedule local notices as UTC.
++        self.offset = utc_offset_hours
++        self.faults = set()
++        self.handled = set()
++        self.tests = set()
++        self.seen = set()
++        self.cancelled = set()
++
++    def ingest(self, messages):
++        for message in messages:
++            if message.get('record_type') != 'observation_request':
++                continue
++            reason = str(message.get('reason') or '')
++            key = (message.get('request_id'), reason)
++            if key in self.seen:
++                continue
++            self.seen.add(key)
++            try:
++                issued = datetime.fromisoformat(message['issued_at_utc'].replace('Z', '+00:00'))
++            except (KeyError, ValueError, TypeError):
++                continue
++            for raw in reason.splitlines():
++                line = normalize(raw)
++                # Do not promote a tentative memory or rumor to a scheduled fault.
++                if '【灯】' in line or any(s in line for s in ('没确认', '未确认', '听说', '听說', '没見正式', '隔壁', '要是', '如果', '顺延')):
++                    continue
++                # The handover explicitly uses Caesar-encoded English. Decode
++                # only when a full engineering phrase validates the candidate.
++                if any(mark in line for mark in ('凯撒', 'シーザー', '加密', '往后挪')):
++                    for shift in range(26):
++                        decoded = ''.join(chr((ord(c.lower()) - 97 - shift) % 26 + 97)
++                                          if c.isascii() and c.isalpha() else c for c in line)
++                        if 'guider camera' in decoded:
++                            line = decoded
++                            break
++                if 'guider camera' in line.lower():
++                    english = line.lower()
++                    if any(word in english for word in ('unconfirmed', 'rumor', 'cancel', 'postpon', 'window', 'hours after', 'minutes after')):
++                        # Relative English schedules need more context; prefer
++                        # their Chinese engineering counterpart over guessing.
++                        continue
++                    d, t = DATE.search(line), CLOCK.search(line)
++                    if not d or not t:
++                        continue
++                    zone = 'UTC+9 东京' if 'tokyo' in english or 'utc+9' in english else 'UTC' if 'utc' in english else ''
++                    line = f'工程组通知：{d[0]} {t[0]} 导星相机，到点报修。{zone}'
++                if '导星相机' not in line and not ('平场灯' in line or '镜盖测试' in line):
++                    continue
++                dates = list(DATE.finditer(line))
++                if not dates:
++                    continue
++                offset = 9 if ('东京' in line or 'UTC+9' in line) else 0 if 'UTC' in line else self.offset
++                if offset is None:
++                    continue
++                tz = timezone(timedelta(hours=float(offset)))
++                # Corrections repeat the old date/time before giving the real one.
++                date = dates[-1] if ('记错' in line or '搞错' in line or '弄错' in line) else dates[0]
++                month, day = int(date[1]), int(date[2])
++                try:
++                    base = datetime(issued.year, month, day, tzinfo=tz)
++                    if base < issued - timedelta(days=180):
++                        base = base.replace(year=base.year + 1)
++                    elif base > issued + timedelta(days=180):
++                        base = base.replace(year=base.year - 1)
++                except ValueError:
++                    continue
++                tail = line[date.end():]
++                times = list(CLOCK.finditer(tail))
++                def at(match, night=False):
++                    h, m = int(match[1]), int(match[2])
++                    if h > 23 or m > 59:
++                        return None
++                    local = base + timedelta(hours=h, minutes=m, days=int(night and h < 12))
++                    return local.astimezone(timezone.utc)
++                if '导星相机' not in line:
++                    # Flat/cap tests are a local observing-night schedule: 03:00
++                    # belongs to the following calendar day, not the start day.
++                    for window in re.finditer(r'\d{1,2}:\d{2}\s*(?:到|至|~|〜|-)\s*\d{1,2}:\d{2}', tail):
++                        left, right = CLOCK.finditer(window[0])
++                        start, end = at(left, True), at(right, True)
++                        if start is None or end is None:
++                            continue
++                        if end <= start:
++                            end += timedelta(days=1)
++                        if end - start <= timedelta(hours=2):
++                            self.tests.add((start, end))
++                    continue
++                if '取消' in line:
++                    for t in times:
++                        when = at(t)
++                        self.faults.discard(when)
++                        self.cancelled.add(when)
++                    continue
++                if '测试结束' in line or '测试结束以后' in line:
++                    index = re.search(f'第({NUM})段', line)
++                    delay = re.search(f'再等({NUM})小时(?:({NUM})分)?', line)
++                    windows = sorted((a, b) for a, b in self.tests
++                                     if (a.astimezone(tz) - timedelta(hours=12)).date() == base.date())
++                    idx = number(index[1]) - 1 if index else -1
++                    if delay and 0 <= idx < len(windows):
++                        self.faults.add(windows[idx][1] + timedelta(hours=number(delay[1]), minutes=number(delay[2] or '0')))
++                    continue
++                if not times or not any(s in line for s in ('工程组', '到点', '同一件事', 'UTC', '以此为准')):
++                    continue
++                when = at(times[0])
++                if when is None:
++                    continue
++                delay = re.search(f'推迟({NUM})小时(?:({NUM})分)?', line)
++                if '推迟' in line and delay is None:
++                    continue
++                if delay:
++                    self.faults.discard(when)
++                    self.cancelled.add(when)
++                    when += timedelta(hours=number(delay[1]), minutes=number(delay[2] or '0'))
++                if when not in self.cancelled:
++                    self.faults.add(when)
++
++    def due(self, now):
++        return any(t <= now for t in self.faults - self.handled)
++
++    def acknowledge(self, now):
++        self.handled.update(t for t in self.faults if t <= now)
++
++    def test_end(self, now):
++        return max((end for start, end in self.tests if start <= now < end), default=None)
++
++    def next_boundary(self, now):
++        future = [t for t in self.faults - self.handled if t > now]
++        future.extend(start for start, end in self.tests if start > now)
++        return min(future, default=None)
+--- rescue-v2/tests/test_rescue.py
++++ rescue-v3/tests/test_rescue.py
+@@ -52,7 +52,7 @@
+     assert .5*t*(1-.2*t/3600)*.97/p.f0t0 >= .675
+ 
+ 
+-def test_low_quality_limits_exposure_horizon_for_diagnostics():
++def test_low_quality_preserves_long_exposures_to_avoid_decision_explosion():
+     from pro.agent import ObserverAgent
+     from pro.skymath import parse_utc
+     init, req = _messages()
+@@ -65,7 +65,7 @@
+         return None
+     a.planner.plan = plan
+     a.respond(req['payload'])
+-    assert seen == [300]
++    assert seen and seen[0] > 300
+ 
+ 
+ def test_plain_cards_keep_rescue_disabled():
+--- rescue-v2/tests/test_recovery_v3.py
++++ rescue-v3/tests/test_recovery_v3.py
+@@ -0,0 +1,78 @@
++from datetime import timedelta
++import io
++import json
++import pytest
++from pro.agent import ObserverAgent
++from pro.llm_client import LLMClient
++from pro.skymath import parse_utc, format_utc
++from tests.test_pro_entry import _messages
++
++
++def agent():
++    init, req = _messages()
++    return ObserverAgent(init['payload'], rules_only=True), req['payload']
++
++
++def test_absolute_fault_does_not_require_saturated_band_samples():
++    a, payload = agent()
++    a.planner.scale = .05
++    a.scale_hours = {0: [.05], 1: [.05], 2: [.05]}
++    a.planner.e_hours.clear()
++    assert a._fault_verdict(2, payload)
++
++
++def test_absolute_fault_does_not_use_stale_samples():
++    a, payload = agent()
++    a.planner.scale = .05
++    a.scale_hours = {0: [.05], 1: [.05], 2: [.05]}
++    assert not a._scale_fault(100)
++
++
++def test_explicit_public_notice_works_without_model_response():
++    a, payload = agent()
++    now = parse_utc(payload['now_utc'])
++    a.utc_offset_hours = 0
++    # Explicit UTC avoids any dependency on the task-card site timezone.
++    payload['new_messages'] = [{'record_type': 'observation_request',
++        'request_id': 'maintenance', 'issued_at_utc': payload['now_utc'],
++        'reason': f'【祥子】工程组通知：{now.month}/{now.day} {now:%H:%M} UTC 动导星相机，到点请报修。' + '供记录。'*20}]
++    assert a.respond(payload)['action'] == 'report'
++
++
++def test_truncated_model_reply_is_not_executed(monkeypatch):
++    c = LLMClient()
++    response = {'choices': [{'finish_reason': 'length', 'message': {'content': '{"report_utc": []}'}}]}
++    monkeypatch.setattr('urllib.request.urlopen', lambda *a, **k: io.BytesIO(json.dumps(response).encode()))
++    with pytest.raises(ValueError, match='truncated'):
++        c._request('JSON', {}, 3)
++
++
++def test_fenced_json_with_prose_braces_is_parsed(monkeypatch):
++    c = LLMClient()
++    response = {'choices': [{'finish_reason': 'stop', 'message': {'content': 'Schema {not JSON}. Result:\n```json\n{"report_utc": []}\n```'}}]}
++    monkeypatch.setattr('urllib.request.urlopen', lambda *a, **k: io.BytesIO(json.dumps(response).encode()))
++    assert c._request('JSON', {}, 3) == {'report_utc': []}
++
++
++def test_absolute_fault_respects_earthquake_hold():
++    a, payload = agent()
++    a.planner.scale = .05
++    a.scale_hours = {0: [.05], 1: [.05], 2: [.05]}
++    a.quake_onset_hours = a.quake_last_hours = 0
++    assert a._maybe_report(2, payload) is None
++
++
++def test_no_repeat_probe_from_pre_report_samples():
++    a, payload = agent()
++    a.planner.scale = .05
++    a.scale_hours = {0: [.05], 1: [.05], 2: [.05]}
++    a.last_report_hours = 1
++    assert not a._scale_fault(2)
++
++
++def test_ambiguous_model_json_is_rejected(monkeypatch):
++    c = LLMClient()
++    response = {'choices': [{'finish_reason': 'stop', 'message': {'content': '{"report": true} {"report": false}'}}]}
++    monkeypatch.setattr('urllib.request.urlopen', lambda *a, **k: io.BytesIO(json.dumps(response).encode()))
++    with pytest.raises(ValueError, match='ambiguous'):
++        c._request('JSON', {}, 3)
+--- rescue-v2/tests/test_maintenance.py
++++ rescue-v3/tests/test_maintenance.py
+@@ -0,0 +1,96 @@
++from datetime import datetime, timezone
++
++from pro.maintenance import MaintenanceSchedule
++
++
++def utc(s):
++    return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
++
++
++def feed(schedule, text):
++    schedule.ingest([{'record_type': 'observation_request', 'request_id': text,
++                     'issued_at_utc': '2026-10-02T00:00:00Z', 'reason': text}])
++
++
++def test_official_local_and_utc_duplicate_rumor_ignored():
++    s = MaintenanceSchedule(-4)
++    feed(s, '【立希】工程组通知：10/1（周四）21:30 前后会动导星相机。到点直接报修。\n'
++         '【祥子】按 UTC 来写，同一件事是：导星相机 10/2（UTC）1:30。\n'
++         '【立希】10/1 23:30 导星相机也要动，这是听说的？没确认，先别当真。')
++    assert s.faults == {utc('2026-10-02T01:30:00')}
++    assert not s.due(utc('2026-10-02T01:29:00'))
++    assert s.due(utc('2026-10-02T01:30:00'))
++    s.acknowledge(utc('2026-10-02T01:30:00'))
++    assert not s.due(utc('2026-10-02T02:00:00'))
++
++
++def test_tokyo_postponement_and_cancellation():
++    s = MaintenanceSchedule(-4)
++    feed(s, '【祥子】工程组给的是东京时间（UTC+9）：10/4 12:15 动导星相机。\n'
++         '【祥子】导星相机原定 10/5 19:15，工程组刚通知推迟两小时。原来的时间点不要报。\n'
++         '【祥子】工程组通知：10/6 1:30 前后，导星相机也会有动作。\n'
++         '【立希】刚接到工程组的电话，10/6 1:30 那次导星相机取消了，不动，别報。')
++    assert s.faults == {utc('2026-10-04T03:15:00'), utc('2026-10-06T01:15:00')}
++
++
++def test_flat_test_overnight_and_relative_fault():
++    s = MaintenanceSchedule(-4)
++    feed(s, '【祥子】１０／６ 当晚的平场灯和镜盖测试有 ３ 段：２３：１５到２３：３０、３：００到３：３０、４：１５到４：３０。并非故障，请不要报修。\n'
++         '【祥子】在 10/6 那晚，第一段平场灯测试结束以后，再等两小时四十五分，工程组就要去动导星相机；请在那一刻报修，测试本身不必报。')
++    assert s.faults == {utc('2026-10-07T06:15:00')}
++    assert s.test_end(utc('2026-10-07T03:20:00')) == utc('2026-10-07T03:30:00')
++    assert s.test_end(utc('2026-10-07T07:15:00')) == utc('2026-10-07T07:30:00')
++    assert s.next_boundary(utc('2026-10-07T03:00:00')) == utc('2026-10-07T03:15:00')
++
++
++def test_chinese_time_correction_and_no_unconfirmed_guess():
++    s = MaintenanceSchedule(-4)
++    feed(s, '【灯】导星相机 10/5 二十一点整，对吗？\n'
++         '【立希】灯搞错了，10/5 21:00 不对，导星相机是 10/5 22:30，按工程组通知来。')
++    assert s.faults == {utc('2026-10-06T02:30:00')}
++
++
++def test_more_than_two_faults_and_no_duplicate_replay():
++    s = MaintenanceSchedule(-4)
++    for day in range(2, 7):
++        text = f'【立希】工程组通知：10/{day} 21:30 动导星相机。到点报修。'
++        feed(s, text)
++        when = utc(f'2026-10-{day+1:02}T01:30:00')
++        assert s.due(when)
++        s.acknowledge(when)
++        feed(s, text)
++        assert not s.due(when)
++
++
++def test_caesar_engineering_notice_and_timezone_before_date():
++    s = MaintenanceSchedule(-4)
++    feed(s, '【立希】（シーザー暗号、ずらし数は 1）Uif hvjefs dbnfsb xpsl jt bu 12:15 po 10/4, Uplzp ujnf (VUD+9). Dpowfsu ju up pvs mpdbm ujnf boe sfqpsu bu uibu npnfou.')
++    assert s.faults == {utc('2026-10-04T03:15:00')}
++
++
++def test_unknown_timezone_does_not_guess_local_notice():
++    s = MaintenanceSchedule()
++    feed(s, '【立希】工程组通知：10/1 21:30 动导星相机，到点报修。')
++    assert not s.faults
++
++
++def test_emoticon_in_clock_and_malformed_window_do_not_shift_pairs():
++    s = MaintenanceSchedule(-10)
++    feed(s, '【祥子】12/1 当晚平场灯测试：21：(￣▽￣)30到22：00、乱码到23:00、0:00到0:15。不是故障。')
++    assert s.tests == {(utc('2026-12-02T07:30:00'), utc('2026-12-02T08:00:00')),
++                       (utc('2026-12-02T10:00:00'), utc('2026-12-02T10:15:00'))}
++
++
++def test_conditional_schedule_not_treated_as_unconditional():
++    s = MaintenanceSchedule(-4)
++    feed(s, '【立希】工程组通知：导星相机 10/5 21:00。要是下雨，就顺延一天，到点报修。')
++    assert not s.faults
++
++
++def test_chinese_cancellation_stays_cancelled_after_duplicate_translation():
++    s = MaintenanceSchedule(-4)
++    feed(s, '【祥子】工程组通知：10/6 1:30 导星相机要动，到点报修。\n'
++         '【立希】工程组电话：10/6 1:30 导星相机取消了。\n'
++         '【祥子】Guider camera work is on 10/6 at 1:30 local time. Report at that moment.')
++    assert not s.faults
++

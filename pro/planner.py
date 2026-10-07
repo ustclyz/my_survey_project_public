@@ -26,6 +26,7 @@ import heapq
 import math
 import os
 from collections import deque
+from functools import lru_cache
 from datetime import datetime, timedelta
 
 from pro.skymath import (
@@ -49,6 +50,7 @@ def _env(name: str, default):
 
 # --- search -------------------------------------------------------------------------------------------
 LAMBDA_FRAC = _env("LAMBDA_FRAC", 0.6)        # price of telescope time, as a share of the recent best gain rate
+CACHE_GAIN = _env('CACHE_GAIN', 1)  # per-decision only; 0 is the exact comparison path
 LAMBDA_EMA = _env("LAMBDA_EMA", 0.03)
 SCARCITY_REF = _env("SCARCITY_REF", 0.86)     # tuning constant: scarcity at which time is priced fully
 SCARCITY_POWER = _env("SCARCITY_POWER", 1.0)  # time price x min(1, scarcity / SCARCITY_REF) ** power
@@ -184,6 +186,7 @@ class Planner:
         log(f"planner: scarcity {self.scarcity:.2f}, time price fraction {self.lambda_frac:.2f}")
 
         self.scale = 1.0                         # learned sky quality relative to the clear-sky model
+        self.rescue_mode = False  # enabled by public handover notices, not card IDs
         self.prior_scale = 1.0                   # long-run median, used when recent samples are missing
         self.samples: deque = deque(maxlen=24)   # (hours, ratio) of recent unsaturated hits
         self.all_ratios: deque = deque(maxlen=400)
@@ -567,6 +570,33 @@ class Planner:
         self.samples.clear()
         self.all_ratios.clear()
         self.prior_scale = 1.0
+        if self.rescue_mode:
+            self.scale = 1.0
+            self.attempts = [0] * len(self.ids)
+            self.req_calib.clear()
+            self.vcache = None
+
+    def rescue_duration(self, i, m0, m1, limit):
+        """First 30s-grid exposure reaching the required safety margin.
+
+        Uses the same linear quality-vs-duration approximation as gain().
+        No achievable completion within the visibility window => no candidate.
+        """
+        rate = self.flux[i] * self.scale * PLAN_FACTOR_SAFETY
+        if rate <= 0 or m0 <= 0:
+            return None
+        need = .5 * REQ_P_HI * self.f0t0 / rate
+        slope = (m1 - m0) / 3600.
+        discriminant = m0*m0 + 4*slope*need
+        if discriminant < 0:
+            return None
+        root = 2*need / max(1e-12, m0 + math.sqrt(discriminant))
+        duration = max(self.min_exposure, int(math.ceil(root / 30.))*30)
+        if duration > min(limit, self.max_exposure):
+            return None
+        if duration*(m0+slope*duration) + 1e-8 < need:
+            return None
+        return duration
 
     # --- planning --------------------------------------------------------------------------------
 
@@ -716,11 +746,23 @@ class Planner:
                 up = (h - ha) / SIDEREAL_DEG_PER_SECOND if h < 180.0 else 1e9
                 lunar = moon.lunar_factor(self.ra[i], self.dec[i])
                 nights_left = max(1, self.last_night[i] - night_index + 1)
-                damp = 0.6 ** self.misses[i] * 0.8 ** self.attempts[i]
+                attempt_damp = 0.8 ** self.attempts[i]
+                if self.rescue_mode and self.required[i] and self.factor[i] < .5:
+                    attempt_damp = max(.25, attempt_damp)
+                damp = 0.6 ** self.misses[i] * attempt_damp
                 item = base[i] = (alt, az, lunar, up, (1.0 + URGENCY / nights_left) * damp * dirf)
             return item
 
         pool = [i for _, i in (heapq.nlargest(pool_size, proxy) if len(proxy) > pool_size else proxy)]
+        rescue_targets = []
+        if self.rescue_mode and self.scale >= .15:
+            # Reserve a small candidate quota for required targets losing their
+            # seasonal window, rather than letting dense science fields crowd
+            # them out. Exact geometry and gain still decide the winning field.
+            urgent = (i for i in visible if self.required[i] and self.factor[i] < .5)
+            rescue_targets = heapq.nsmallest(8 if level < 2 else 2, urgent,
+                key=lambda i: (max(1, self.last_night[i]-night_index+1), self.attempts[i], -self.flux[i]))
+            pool.extend(i for i in rescue_targets if i not in pool)
         for i in pool:
             exact(i)
         pool = [i for i in pool if base[i] is not None]
@@ -745,6 +787,7 @@ class Planner:
             its best exposure counts (a partial exposure is wasted if the target is redone later)."""
             return top_mult * (v / top_mult) ** KAPPA if KAPPA != 1.0 else v
 
+        @lru_cache(maxsize=32768 if CACHE_GAIN else 0)
         def gain(i, T):
             alt, az, m0, m1, up, mult = full(i)
             if up < T:
@@ -812,6 +855,10 @@ class Planner:
         ranked.sort(reverse=True)
         n_anchors = (N_ANCHORS, 3, 1, 1)[min(level, 3)]
         anchors = [i for _, i in ranked[:n_anchors]]
+        if self.rescue_mode:
+            for i in rescue_targets[:(4 if level < 2 else 1)]:
+                if i not in anchors and base.get(i) is not None:
+                    anchors.append(i)
         if N_DENSE and level <= 1 and bins:
             # also try the densest patches of remaining science: fields with no single outstanding target
             for _, key in heapq.nlargest(N_DENSE if level == 0 else 2, ((v, k) for k, v in bins.items())):
@@ -837,7 +884,23 @@ class Planner:
             if not cells:
                 return None
             found = None
-            for T in durations:
+            candidate_durations = durations
+            if self.rescue_mode and level < 3:
+                thresholds = set()
+                for js in cells.values():
+                    for j in js:
+                        if self.required[j] and self.factor[j] < .5:
+                            _, _, m0, m1, up, _ = full(j)
+                            t = self.rescue_duration(j, m0, m1, min(up, seconds_left))
+                            if t is not None:
+                                thresholds.add(t)
+                # Keep a bounded spread of completion thresholds: additional
+                # candidates compete with all existing fixed-duration options.
+                ordered = sorted(thresholds)
+                if len(ordered) > 4:
+                    ordered = [ordered[round(k*(len(ordered)-1)/3)] for k in range(4)]
+                candidate_durations = sorted(set(durations).union(ordered))
+            for T in candidate_durations:
                 total = 0.0
                 pick = {}
                 for fib, js in cells.items():

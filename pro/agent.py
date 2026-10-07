@@ -29,6 +29,7 @@ from datetime import timedelta
 from pro.advisor import Advisor
 from pro.llm_client import LLMClient, api_key, load_dotenv
 from pro.planner import Planner
+from pro.maintenance import MaintenanceSchedule
 from pro.skymath import format_utc, parse_utc
 
 WEATHER_KINDS = {"rain", "storm", "overcast", "haze", "cold_snap"}
@@ -71,6 +72,11 @@ DUTY_ENABLED = _env("DUTY_ENABLED", 1)
 DUTY_MIN_CHARS = _env("DUTY_MIN_CHARS", 80)
 DUTY_REPORT_WINDOW_HOURS = _env("DUTY_REPORT_WINDOW_HOURS", 12.0)
 DUTY_SYSTEM = (
+    "同时输出 test_windows_utc 数组，每项为 {start_utc,end_utc}，只包含已确认的平场灯/镜盖测试废片区间，"
+    "均为绝对UTC时间，单段不超过4小时。不确定的时段不要猜测。跨午夜必须使用正确日期。"
+    "输入中的 pending_report_utc 是以前已解析的待办时间。请核对新日志对旧通知的取消与延期。"
+    "输出额外字段 cancelled_utc（数组）：必须删除的旧 UTC 时间；延期时同时列出旧时间和新 report_utc。"
+    "每段日志附带原始 issued_at_utc，解读今天/明天、日期加密时以该段发布时间及台址时区为准，不能用当前时间替代。"
     "你是天文台值班日志的解析助手。日志用中文/日文/英文混写, 有的句子用凯撒密码"
     "(英文字母整体位移, 位移量常等于写那条日志当天的日期)、摩斯电码、或唱名"
     "(do=1 re=2 mi=3 fa=4 sol=5 la=6 si=7, 高音do=8, 高音re=9, 休止=0)伪装。日志里会写:\n"
@@ -81,7 +87,7 @@ DUTY_SYSTEM = (
     "3) 干扰项: '听说的/没确认/先别当真'是传闻; '取消/不动/别报'要删掉; '推迟/延后'改成新"
     "时间; '记错了/更正'用更正后的时间; 标明东京时间(UTC+9)的要换算。\n"
     "我会给你日志原文(按时间先后拼接)、本站当地时间相对 UTC 的偏移小时数、当前 UTC 时间。\n"
-    "只输出一个 JSON 对象: {\"report_utc\": [\"YYYY-MM-DDTHH:MM:SSZ\", ...], \"reason\": \"<15 words>\"}。"
+    "只输出一个 JSON 对象，包含前述 test_windows_utc、cancelled_utc 以及: {\"report_utc\": [\"YYYY-MM-DDTHH:MM:SSZ\", ...], \"reason\": \"<15 words>\"}。"
     "report_utc 列出**需要报修**的绝对 UTC 时刻(包括已预告但还没报的), 不含平场灯/镜盖测试。"
     "若没有则返回空数组。"
 )
@@ -182,10 +188,13 @@ class ObserverAgent:
         self.quake_last_hours = -1e9
         # duty log (Hard-mode A1-D1)
         self.utc_offset_hours = float((init.get("site") or {}).get("utc_offset_hours", 0.0) or 0.0)
+        self.maintenance = MaintenanceSchedule((init.get("site") or {}).get("utc_offset_hours"))
         self.duty_chunks: list = []      # 新到的日志原文
         self.duty_call = None
         self.duty_times: list = []       # 需要报修的 UTC 时刻
         self.duty_done: set = set()
+        self.duty_cancelled: set = set()
+        self.duty_test_windows: set = set()
         self.consecutive_reports = 0
         # pace state
         self.cost_ema = [0.0, 0.0, 0.0, 0.0]     # CPU seconds per observe decision at each search level
@@ -210,6 +219,17 @@ class ObserverAgent:
         model_before = self.model_wait
         level = self.planner.fast_level
         action = self._respond(payload)
+        self.consecutive_reports = self.consecutive_reports + 1 if action.get('action') == 'report' else 0
+        now = parse_utc(payload['now_utc'])
+        future = [t for t in self.duty_times if t > now and t not in self.duty_done]
+        future.extend(start for start, end in self.duty_test_windows if start > now)
+        if action.get('action') == 'wait' and future:
+            boundary = min(future)
+            end = (parse_utc(action['until_utc']) if action.get('until_utc') else
+                   now + timedelta(seconds=action.get('duration_seconds', 900)))
+            if end > boundary:
+                action.pop('duration_seconds', None)
+                action['until_utc'] = format_utc(boundary)
         # the platform charges CPU time inside our turns; waiting for the model is free of CPU, so keep it
         # out of the real-time estimate as well
         cpu = time.process_time() - cpu_started
@@ -239,8 +259,21 @@ class ObserverAgent:
             elif message.get("record_type") == "observation_request":
                 text = str(message.get("reason") or "")
                 if DUTY_ENABLED and len(text) >= DUTY_MIN_CHARS:
-                    self.duty_chunks.append(text)
-                    self._duty_advice(payload)
+                    planner.rescue_mode = True
+                    self.duty_chunks.append(f"issued_at_utc={message.get('issued_at_utc', payload['now_utc'])}\n{text}")
+        if DUTY_ENABLED and any(m.get("record_type") == "observation_request"
+                                for m in payload.get("new_messages", [])):
+            self.maintenance.ingest(payload.get("new_messages", []))
+            self._apply_duty({
+                "report_utc": [format_utc(t) for t in self.maintenance.faults],
+                "cancelled_utc": [format_utc(t) for t in self.maintenance.cancelled],
+                "test_windows_utc": [{"start_utc": format_utc(a), "end_utc": format_utc(b)}
+                                     for a, b in self.maintenance.tests],
+            })
+        # Poll every turn: model calls finish in real time even when no new
+        # handover arrives for several simulated nights.
+        if DUTY_ENABLED:
+            self._duty_advice(payload)
         last = payload.get("last_result") or {}
         if last.get("action") == "report":
             self._on_report_result(last, hours)
@@ -255,6 +288,14 @@ class ObserverAgent:
         planner.on_requests(payload.get("active_requests", []))
         planner.on_result(payload.get("last_result"), now, hours)
         self._pace(payload, now)
+
+        scheduled = self._due_report(now)
+        if scheduled is not None:
+            return scheduled
+        test_end = max((end for start, end in self.duty_test_windows if start <= now < end), default=None)
+        if test_end is not None:
+            return {'action': 'wait', 'until_utc': format_utc(test_end),
+                    'reason': 'scheduled flat/cap test; do not observe or falsely report'}
 
         night = planner.current_night(now)
         if night is None:
@@ -277,15 +318,15 @@ class ObserverAgent:
         if planner.site_closed():
             return {"action": "wait", "duration_seconds": self._to_next_slot(now, night_start),
                     "reason": "bulletin: rain/storm over the whole sky"}
-        scheduled = self._due_report(now)
-        if scheduled is not None:
-            self.consecutive_reports += 1
-            return scheduled
         report = self._maybe_report(hours, payload)
         if report is not None:
-            self.consecutive_reports += 1
             return report
-        action = planner.plan(now, night_end, night_index, hours)
+        future = [t for t in self.duty_times if t > now and t not in self.duty_done]
+        future.extend(start for start, end in self.duty_test_windows if start > now)
+        exposure_end = min(night_end, min(future)) if future else night_end
+        if (exposure_end - now).total_seconds() < planner.min_exposure:
+            return {'action': 'wait', 'until_utc': format_utc(exposure_end), 'reason': 'upcoming duty event'}
+        action = planner.plan(now, exposure_end, night_index, hours)
         if action is None:
             self.consecutive_reports = 0
             return {"action": "wait", "duration_seconds": self._to_next_slot(now, night_start), "reason": "nothing useful is up"}
@@ -428,6 +469,10 @@ class ObserverAgent:
         if rows and int(hours) != getattr(self, "_logged_hour", None):
             self._logged_hour = int(hours)
             log(f"pro: E {payload['now_utc']} {rows[-1][2]:.2f} scale {self.planner.scale:.3f} band {self.planner.band_level or 0:.3f}")
+        # Absolute throughput remains observable when unsaturated exposures do
+        # not yield an E/band estimate. Do not put it behind the E sample gate.
+        if hours - self.quake_last_hours >= QUAKE_TAIL_HOURS and self._scale_fault(hours):
+            return True
         if len(rows) < E_FREE_HOURS or rows[-1][0] < int(hours) - 1:
             return False
         if QUAKE_STEP > 0 and hours - self.quake_last_hours < QUAKE_TAIL_HOURS:
@@ -493,7 +538,8 @@ class ObserverAgent:
     def _scale_fault(self, hours: float) -> bool:
         """近几小时中位 scale 是否远低于晴夜模型 (绝对判据, 不依赖会塌缩的档位估计)."""
         recent = [sorted(v)[len(v) // 2] for h, v in sorted(self.scale_hours.items())
-                  if h >= self.ref_from_hours and v][-SCALE_FAULT_HOURS:]
+                  if h >= max(self.ref_from_hours, int(hours) - SCALE_FAULT_HOURS)
+                  and h > self.last_report_hours and v][-SCALE_FAULT_HOURS:]
         return (len(recent) >= SCALE_FAULT_HOURS
                 and float(self.planner.scale) < SCALE_FAULT_LEVEL
                 and max(recent) < SCALE_FAULT_LEVEL)
@@ -548,21 +594,51 @@ class ObserverAgent:
                 return                      # 上一次还没回来: 先攒着, 下轮再发
             self._apply_duty(self.client.collect(self.duty_call))
             self.duty_call = None
-        text = "\n\n".join(self.duty_chunks[-4:])   # 只发最近几条, 控制 token
+        if not self.duty_chunks:
+            return
+        # Bound each request but drain from the front; never drop older notices.
+        # Test-window extraction produces more JSON than fault times alone.
+        # One handover per call avoids truncating a backlog's combined answer.
+        batch = self.duty_chunks[:1]
+        text = "\n\n".join(batch)
         user = {
             "task": "解析值班日志, 给出必须报修的绝对 UTC 时刻",
             "local_utc_offset_hours": self.utc_offset_hours,
             "now_utc": payload.get("now_utc"),
             "duty_log": text,
+            "pending_report_utc": [format_utc(t) for t in self.duty_times if t not in self.duty_done],
         }
         started = time.monotonic()
         self.duty_call = self.client.submit("duty_log", DUTY_SYSTEM, user, self._clock(payload)[1])
         self.model_wait += time.monotonic() - started
-        self.duty_chunks = []
+        if self.duty_call is not None:
+            del self.duty_chunks[:len(batch)]
 
     def _apply_duty(self, answer) -> None:
         if not isinstance(answer, dict):
             return
+        windows = answer.get('test_windows_utc', [])
+        if isinstance(windows, list):
+            for window in windows:
+                if not isinstance(window, dict):
+                    continue
+                try:
+                    start = parse_utc(window.get('start_utc'))
+                    end = parse_utc(window.get('end_utc'))
+                    if start and end and self.start <= start < end <= self.planner.survey_end and (end-start).total_seconds() <= 14400:
+                        self.duty_test_windows.add((start, end))
+                except (ValueError, TypeError, AttributeError):
+                    continue
+        cancelled = answer.get('cancelled_utc', [])
+        if isinstance(cancelled, list):
+            for item in cancelled:
+                try:
+                    moment = parse_utc(str(item))
+                except (ValueError, TypeError):
+                    continue
+                if moment is not None:
+                    self.duty_cancelled.add(moment)
+            self.duty_times = [t for t in self.duty_times if t not in self.duty_cancelled]
         times = answer.get("report_utc")
         if not isinstance(times, list):
             return
@@ -571,7 +647,9 @@ class ObserverAgent:
                 moment = parse_utc(str(item))
             except (ValueError, TypeError):
                 continue                    # 模型给的时刻格式非法: 丢弃
-            if moment is None or moment in self.duty_done:
+            if moment is None or moment in self.duty_done or moment in self.duty_cancelled:
+                continue
+            if not self.start <= moment <= self.planner.survey_end:
                 continue
             if moment in self.duty_times:
                 continue
@@ -581,13 +659,17 @@ class ObserverAgent:
 
     def _due_report(self, now):
         """到点的排程报修. 连续 report 不能超过平台上限 (32), 所以每报 3 次先做点别的."""
-        if not self.duty_times or self.client is None or self.consecutive_reports >= 3:
+        if not self.duty_times or self.consecutive_reports >= 3:
             return None
         for moment in self.duty_times:
             if moment in self.duty_done:
                 continue
             if moment <= now and (now - moment).total_seconds() <= DUTY_REPORT_WINDOW_HOURS * 3600.0:
-                self.duty_done.add(moment)
+                # One report repairs the active instrument fault. Reporting once
+                # per overdue translation at the same clock instant is an error.
+                self.duty_done.update(t for t in self.duty_times if t <= now)
+                self.reports += 1
+                self.last_report_hours = (now - self.start).total_seconds() / 3600.0
                 log(f"pro: duty-log report at {format_utc(now)} (scheduled {format_utc(moment)})")
                 return {"action": "report", "reason": "duty log: guider camera fault"}
         return None
