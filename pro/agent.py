@@ -28,7 +28,7 @@ from datetime import timedelta
 
 from pro.advisor import Advisor
 from pro.llm_client import LLMClient, api_key, load_dotenv
-from pro.planner import Planner
+from pro.planner import DIRECTION_AZ, Planner
 from pro.skymath import format_utc, parse_utc
 
 WEATHER_KINDS = {"rain", "storm", "overcast", "haze", "cold_snap"}
@@ -73,21 +73,51 @@ SCALE_FAULT_HOURS = _env("SCALE_FAULT_HOURS", 1)
 DUTY_ENABLED = _env("DUTY_ENABLED", 1)
 DUTY_MIN_CHARS = _env("DUTY_MIN_CHARS", 80)
 DUTY_REPORT_WINDOW_HOURS = _env("DUTY_REPORT_WINDOW_HOURS", 12.0)
-DUTY_SYSTEM = (
-    "你是天文台值班日志的解析助手。日志用中文/日文/英文混写, 有的句子用凯撒密码"
-    "(英文字母整体位移, 位移量常等于写那条日志当天的日期)、摩斯电码、或唱名"
-    "(do=1 re=2 mi=3 fa=4 sol=5 la=6 si=7, 高音do=8, 高音re=9, 休止=0)伪装。日志里会写:\n"
-    "1) 何时'动导星相机'(导星/导星相机/guider camera 作业): 从那一刻起所有曝光都是废片, "
-    "一直到有人报修为止 -> 必须在那个时刻报修(日志原话: '到点直接报修').\n"
-    "2) 平场灯/镜盖测试(flat-lamp/镜盖/cover test)时段: 数据也是废片, 但**不是故障**, "
-    "绝对不要报修(报了算误报)。\n"
-    "3) 干扰项: '听说的/没确认/先别当真'是传闻; '取消/不动/别报'要删掉; '推迟/延后'改成新"
-    "时间; '记错了/更正'用更正后的时间; 标明东京时间(UTC+9)的要换算。\n"
-    "我会给你日志原文(按时间先后拼接)、本站当地时间相对 UTC 的偏移小时数、当前 UTC 时间。\n"
-    "只输出一个 JSON 对象: {\"report_utc\": [\"YYYY-MM-DDTHH:MM:SSZ\", ...], \"reason\": \"<15 words>\"}。"
-    "report_utc 列出**需要报修**的绝对 UTC 时刻(包括已预告但还没报的), 不含平场灯/镜盖测试。"
-    "若没有则返回空数组。"
-)
+DUTY_HISTORY_CHARS = _env("DUTY_HISTORY_CHARS", 40000)   # 多轮历史的总字符预算
+DUTY_NO_REPORT_HOURS = _env("DUTY_NO_REPORT_HOURS", 1.0)  # 平场灯/镜盖测试窗口的半宽
+DUTY_SYSTEM = """你是天文台的值班助手, 负责把站里的【值班日志】变成可执行的运行决策。
+日志用中文/日文/英文混写; 有的句子用凯撒密码(英文字母整体位移, 位移量常等于写那条日志当天的日期)、
+摩斯电码、唱名(do=1 re=2 mi=3 fa=4 sol=5 la=6 si=7, 高音do=8, 高音re=9, 休止=0)伪装。
+对话会逐条把新日志发给你。你要累积地维护一份运行状态, 并且**每一轮都输出全量结果**(不是增量),
+因为你的上一次输出会被丢弃、只保留这一次的。
+
+日志里的关键信息:
+1) 动导星相机 (导星/guider camera 作业): 从那一刻起所有曝光都是废片, 一直到有人报修为止,
+   所以必须在那个时刻报修 (原话: 到点直接报修 / 到点就报)。收进 report_utc。
+2) 平场灯 / 镜盖测试 (flat-lamp / cover test) 时段: 数据也是废片, 但**不是故障**, 绝对不要报修。
+   收进 no_report_utc。
+3) 山体/地形遮挡 (例如"东南的山 32 度"、"西南 37 度"、"天顶距 52 度以内可以拍"): 收进 terrain,
+   给出 direction 与"该方向低于此高度角就不能观测"的 min_alt_deg。
+   "某个方向风大要关" / "发射窗口, 那个方向封" 这类方向性封锁也收进 avoid_directions。
+4) 长期预报里"整体偏差 / 别把重要目标押在这晚"的夜晚 -> bad_nights (当地日期 YYYY-MM-DD)。
+   薄云/薄霾但注明"照拍"的不算坏夜, 只写进 notes。
+5) 干扰项必须正确处理: "听说的 / 没确认 / 先别当真"是传闻(丢弃); "取消 / 不动 / 别报"要删除;
+   "推迟 / 延后"改成新时间; "记错了 / 更正"用更正后的时间; 标明东京时间(UTC+9)或(UTC)的要换算;
+   同一件事被不同时间重复提到时, 以最后确认的版本为准。
+
+我会给你日志原文、本站当地时间相对 UTC 的偏移小时数、当前 UTC 时间, 以及你上一轮的全量输出。
+每轮只输出一个 JSON 对象, 键固定为:
+{"report_utc": ["YYYY-MM-DDTHH:MM:SSZ", ...],
+ "no_report_utc": [...],
+ "avoid_directions": ["SE", ...],
+ "terrain": [{"direction": "SW", "min_alt_deg": 37}],
+ "bad_nights": ["2026-10-20", ...],
+ "prefer_directions": [{"direction": "E", "weight": 0.8}],
+ "prefer_targets": ["V4T001234", ...],
+ "duration_scale": 1.0,
+ "lambda_scale": 1.0,
+ "notes": "200 字以内, 记录仍需记住的约定与未决事项",
+ "reason": "15 words 以内的理由"}
+所有时刻都是【绝对 UTC】。report_utc 要包含所有已预告但还没报修的故障时刻(含过去漏掉的);
+不含平场灯/镜盖测试。没有就返回空数组。
+
+下面这些键是**直接作用到观测决策**的旋钮 (这是你影响决策的方式, 别浪费):
+* prefer_directions: 日志里点名"照拍得比较好 / 重点保住"的方位, weight 0..1, 越大越优先。
+* prefer_targets: 日志/请求点名要保住的**公开目标 ID**(必须来自输入里出现过的 ID, 不确定就别填)。
+* duration_scale: 0.5~2.0。日志说"暗弱目标难做/天气好"就调大(曝光更长), 说"时间紧/覆盖优先"就调小。
+* lambda_scale: 0.3~2.0。调小 = 更愿意把单个目标打满(时间不值钱); 调大 = 更看重多拍新目标(时间紧)。
+* bad_nights 里的夜晚, planner 会当成坏夜, 不把暗弱必观测押上去。
+以上旋钮按"本期整体状态"给; 没有依据就填 1.0 / 空数组。只输出 JSON, 不要解释。"""
 # The participant guide: an earthquake (announced in the bulletin) lowers instrument efficiency, the loss fades
 # night by night, and a report does not repair it. So E drops right after an earthquake are not reportable, and
 # while its effect may last only a new step down in E (a fresh drop from the preceding hours) is fault evidence.
@@ -183,12 +213,17 @@ class ObserverAgent:
         self.quake_on = False
         self.quake_onset_hours = -1e9
         self.quake_last_hours = -1e9
-        # duty log (Hard-mode A1-D1)
+        # duty log (Hard-mode A1-D1): 多轮 LLM 会话, 历史日志全部进请求
         self.utc_offset_hours = float((init.get("site") or {}).get("utc_offset_hours", 0.0) or 0.0)
-        self.duty_chunks: list = []      # 新到的日志原文
+        self.duty_history: list = []     # LLM 请求的完整多轮历史 [{"role","content"}, ...]
+        self.duty_pending: list = []     # 尚未送出的新日志条目
         self.duty_call = None
+        self.duty_state: dict = {}       # 最近一次的全量解析结果 (同时用于历史裁剪时的继承)
         self.duty_times: list = []       # 需要报修的 UTC 时刻
         self.duty_done: set = set()
+        self.duty_no_report: list = []   # "废片但不是故障"的窗口中心 (UTC)
+        self.duty_bad_nights: set = set()
+        self.duty_updates = 0
         self.consecutive_reports = 0
         # pace state
         self.cost_ema = [0.0, 0.0, 0.0, 0.0]     # CPU seconds per observe decision at each search level
@@ -242,8 +277,8 @@ class ObserverAgent:
             elif message.get("record_type") == "observation_request":
                 text = str(message.get("reason") or "")
                 if DUTY_ENABLED and len(text) >= DUTY_MIN_CHARS:
-                    self.duty_chunks.append(text)
-                    self._duty_advice(payload)
+                    self.duty_pending.append({"issued_at_utc": message.get("issued_at_utc"), "duty_log": text})
+                    self._duty_tick(payload)
         last = payload.get("last_result") or {}
         if last.get("action") == "report":
             self._on_report_result(last, hours)
@@ -280,6 +315,9 @@ class ObserverAgent:
         if planner.site_closed():
             return {"action": "wait", "duration_seconds": self._to_next_slot(now, night_start),
                     "reason": "bulletin: rain/storm over the whole sky"}
+        # 值班日志点名的"整体偏差夜": 当作坏夜, 别把暗弱必观测押上去
+        if self.duty_bad_nights and (night_start - timedelta(hours=12)).date().isoformat() in self.duty_bad_nights:
+            planner.bad_forecast = True
         scheduled = self._due_report(now)
         if scheduled is not None:
             self.consecutive_reports += 1
@@ -414,6 +452,9 @@ class ObserverAgent:
 
         A report costs no time, its answer arrives at once, and the first false reports after each correct
         one are free: spend free probes readily, paid ones only on strong, lasting evidence."""
+        # 值班日志明确说过这些时段是"废片但不是故障"(平场灯/镜盖测试): 报修会算误报。
+        if self._in_no_report_window(parse_utc(payload["now_utc"])):
+            return None
         if self.false_reports >= MAX_FALSE_REPORTS or hours - self.last_report_hours < MIN_REPORT_SPACING_HOURS:
             return None
         if hours - self.quake_onset_hours < QUAKE_HOLD_HOURS:
@@ -539,48 +580,153 @@ class ObserverAgent:
             log(f"pro: report false (delta {result.get('score_delta')}); free left {self.free_left()}")
 
 
-    # --- 值班日志排程 (Hard-mode A1-D1) ----------------------------------------------------------
+    # --- 值班日志: 多轮 LLM 会话 (Hard-mode A1-D1) ------------------------------------------------
+    #
+    # 设计要点 (对照官方文档与 A1-D1 任务卡):
+    #   * 值班日志随 observation_request 逐条下发, 条目之间**互相引用**(推迟/更正/取消/换算),
+    #     只看最新一条必然误判 -> 所以把**全部历史**放进 LLM 请求的多轮 messages 里;
+    #   * 每轮要求模型输出**全量**运行状态 (报修时刻/禁报窗口/规避方向/地形阈值/坏夜), 我们
+    #     直接采用这一版, 于是"状态"随历史自然累积, 不会因为丢掉旧原文而丢失结论;
+    #   * 历史超预算时成对丢弃最早的 user/assistant 轮, 并在最前面放一条"上一版全量状态"
+    #     作为继承, 保证结论不丢;
+    #   * 解析结果直接驱动决策: 到点报修、禁报窗口内不误报、规避方向/地形阈值交给规划器。
 
-    def _duty_advice(self, payload: dict) -> None:
-        """把新到的值班日志交给模型, 解析出"需要报修的绝对 UTC 时刻" (后台线程, 不阻塞决策)."""
+    def _duty_tick(self, payload: dict) -> None:
+        """有新一轮日志时推进多轮会话 (后台线程, 不阻塞决策)."""
         if self.client is None:
-            self.duty_chunks = []
+            self.duty_pending = []
             return
         if self.duty_call is not None:
             if not self.duty_call.done():
-                return                      # 上一次还没回来: 先攒着, 下轮再发
-            self._apply_duty(self.client.collect(self.duty_call))
+                return                      # 上一轮还没回来: 先攒着, 下轮再发
+            answer = self.client.collect(self.duty_call)
             self.duty_call = None
-        text = "\n\n".join(self.duty_chunks[-4:])   # 只发最近几条, 控制 token
-        user = {
-            "task": "解析值班日志, 给出必须报修的绝对 UTC 时刻",
+            if answer is None:
+                # 调用失败: 把这一轮从历史里撤掉, 日志下次重发 (不把失败当结论)
+                if self.duty_history and self.duty_history[-1].get("role") == "user":
+                    dropped = self.duty_history.pop()
+                    try:
+                        again = json.loads(dropped.get("content") or "{}")
+                        if again.get("duty_log"):
+                            self.duty_pending.insert(0, {"issued_at_utc": again.get("issued_now_utc"),
+                                                         "duty_log": again["duty_log"]})
+                    except (ValueError, TypeError):
+                        pass
+            else:
+                self.duty_history.append({"role": "assistant",
+                                          "content": json.dumps(answer, ensure_ascii=False, separators=(",", ":"))})
+                self._apply_duty(answer)
+        if not self.duty_pending:
+            return
+        turn = {
+            "duty_log": "\n\n".join(str(e.get("duty_log") or "") for e in self.duty_pending),
             "local_utc_offset_hours": self.utc_offset_hours,
-            "now_utc": payload.get("now_utc"),
-            "duty_log": text,
+            "issued_now_utc": payload.get("now_utc"),
         }
+        self.duty_history.append({"role": "user",
+                                  "content": json.dumps(turn, ensure_ascii=False, separators=(",", ":"))})
+        self._trim_duty_history()
+        messages = [{"role": "system", "content": DUTY_SYSTEM}] + self.duty_history
         started = time.monotonic()
-        self.duty_call = self.client.submit("duty_log", DUTY_SYSTEM, user, self._clock(payload)[1])
+        call = self.client.submit_messages("duty_log", messages, self._clock(payload)[1])
         self.model_wait += time.monotonic() - started
-        self.duty_chunks = []
+        if call is None:
+            self.duty_history.pop()         # 预算不允许: 撤轮, 下轮重试 (duty_pending 保留)
+            return
+        self.duty_call = call
+        self.duty_pending = []
+
+    def _duty_chars(self) -> int:
+        return sum(len(m.get("content") or "") for m in self.duty_history)
+
+    def _trim_duty_history(self) -> None:
+        """历史超预算时, 成对丢弃最早的 user/assistant 轮, 并在头部放一条"继承状态"."""
+        if self._duty_chars() <= DUTY_HISTORY_CHARS or len(self.duty_history) <= 2:
+            return
+        carry = {"role": "user", "content": json.dumps(
+            {"carried_state": self.duty_state,
+             "note": "更早的原始日志已省略; 请以上一版全量状态为准继续累积"},
+            ensure_ascii=False, separators=(",", ":"))}
+        while len(self.duty_history) > 1 and self._duty_chars() > DUTY_HISTORY_CHARS:
+            self.duty_history.pop(0)
+        self.duty_history.insert(0, carry)
+        log(f"pro: duty history 裁剪到 {self._duty_chars()} 字符 (保留继承状态)")
+
+    @staticmethod
+    def _duty_time(value):
+        try:
+            return parse_utc(str(value))
+        except (ValueError, TypeError):
+            return None
 
     def _apply_duty(self, answer) -> None:
+        """采用模型给出的**全量**状态, 并把它接进规划器与报修逻辑."""
         if not isinstance(answer, dict):
             return
-        times = answer.get("report_utc")
-        if not isinstance(times, list):
-            return
-        for item in times:
+        self.duty_state = answer
+        self.duty_updates += 1
+        times = sorted({m for m in (self._duty_time(x) for x in (answer.get("report_utc") or [])) if m})
+        self.duty_times = [t for t in times if t not in self.duty_done]
+        self.duty_no_report = [m for m in (self._duty_time(x) for x in (answer.get("no_report_utc") or [])) if m]
+        self.duty_bad_nights = {str(x)[:10] for x in (answer.get("bad_nights") or []) if str(x).strip()}
+        # 方向性规避 (风大关闭 / 发射窗口封锁 / 日志点名的方位)
+        avoid = {str(d).upper() for d in (answer.get("avoid_directions") or [])}
+        avoid = {d for d in avoid if d in DIRECTION_AZ}
+        if avoid:
+            self.planner.extra_avoid |= avoid
+        # 地形遮挡的最低高度角 (公告只说方向, 日志给出阈值)
+        for item in (answer.get("terrain") or []):
+            if not isinstance(item, dict):
+                continue
+            direction = str(item.get("direction", "")).upper()
             try:
-                moment = parse_utc(str(item))
-            except (ValueError, TypeError):
-                continue                    # 模型给的时刻格式非法: 丢弃
-            if moment is None or moment in self.duty_done:
+                min_alt = float(item.get("min_alt_deg"))
+            except (TypeError, ValueError):
                 continue
-            if moment in self.duty_times:
+            if direction in DIRECTION_AZ and 0.0 <= min_alt <= 89.0:
+                self.planner.terrain_min_alt[direction] = min_alt
+        # 优先方位 (0..1)
+        prefer: dict = {}
+        for item in (answer.get("prefer_directions") or []):
+            if isinstance(item, dict):
+                direction = str(item.get("direction", "")).upper()
+                try:
+                    weight = float(item.get("weight"))
+                except (TypeError, ValueError):
+                    continue
+            else:
+                direction, weight = str(item).upper(), 0.6
+            if direction in DIRECTION_AZ:
+                prefer[direction] = max(0.0, min(1.0, weight))
+        if prefer:
+            self.planner.llm_prefer = prefer
+        # 重点目标 (日志点名的公开目标 ID) -> 价值倍率
+        known = set(self.planner.ids)
+        boost = {str(t): 2.0 for t in (answer.get("prefer_targets") or []) if str(t) in known}
+        if boost:
+            self.planner.llm_target_boost = boost
+        # 两个连续旋钮: 曝光时长倍率 / 时间价格倍率
+        for key, attr, lo, hi in (("duration_scale", "llm_duration_scale", 0.5, 2.0),
+                                  ("lambda_scale", "llm_lambda_scale", 0.3, 2.0)):
+            try:
+                value = max(lo, min(hi, float(answer.get(key))))
+            except (TypeError, ValueError):
                 continue
-            self.duty_times.append(moment)
-            log(f"pro: duty log -> scheduled fault report at {format_utc(moment)}")
-        self.duty_times.sort()
+            setattr(self.planner, attr, value)
+        log(f"pro: duty log #{self.duty_updates}: report={len(self.duty_times)} "
+            f"no_report={len(self.duty_no_report)} avoid={sorted(avoid)} "
+            f"terrain={self.planner.terrain_min_alt} bad_nights={len(self.duty_bad_nights)} "
+            f"prefer={self.planner.llm_prefer} boost={len(self.planner.llm_target_boost)} "
+            f"dur={self.planner.llm_duration_scale} lam={self.planner.llm_lambda_scale} "
+            f"notes={str(answer.get('notes') or '')[:80]!r}")
+
+    def _in_no_report_window(self, now) -> bool:
+        """当前是否落在值班日志点名的"废片但不是故障"窗口里 (平场灯/镜盖测试)."""
+        half = DUTY_NO_REPORT_HOURS * 3600.0
+        for moment in self.duty_no_report:
+            if abs((now - moment).total_seconds()) <= half:
+                return True
+        return False
 
     def _due_report(self, now):
         """到点的排程报修. 连续 report 不能超过平台上限 (32), 所以每报 3 次先做点别的."""

@@ -92,20 +92,20 @@ def load_dotenv(path: str) -> None:
 class Call:
     """One background chat completion."""
 
-    def __init__(self, client: "LLMClient", tag: str, system: str, user: dict, timeout: float):
+    def __init__(self, client: "LLMClient", tag: str, messages: list, timeout: float):
         self.tag = tag
         self.answer = None
         self.error = None
         self.seconds = 0.0
         self._done = threading.Event()
-        self._thread = threading.Thread(target=self._run, args=(client, system, user, timeout), daemon=True)
+        self._thread = threading.Thread(target=self._run, args=(client, messages, timeout), daemon=True)
         self._thread.start()
 
-    def _run(self, client, system, user, timeout) -> None:
+    def _run(self, client, messages, timeout) -> None:
         started = time.monotonic()
         for attempt in range(client.max_retries):
             try:
-                self.answer = client._request(system, user, timeout)
+                self.answer = client._request(messages, timeout)
                 self.error = None
                 break
             except (urllib.error.URLError, OSError, ValueError, KeyError, IndexError, TypeError) as exc:
@@ -136,13 +136,9 @@ class LLMClient:
         self.ok = 0
         self.failed = 0
 
-    def _request(self, system: str, user: dict, timeout: float) -> dict:
-        body = json.dumps({
-            "model": self.model,
-            "messages": [{"role": "system", "content": system},
-                         {"role": "user", "content": json.dumps(user, separators=(",", ":"))}],
-            "max_tokens": 2000,
-        }).encode("utf-8")
+    def _request(self, messages: list, timeout: float) -> dict:
+        """把完整的 messages 数组 (含 system / 历史 user+assistant 轮) 发给 /chat/completions."""
+        body = json.dumps({"model": self.model, "messages": messages, "max_tokens": 2000}).encode("utf-8")
         request = urllib.request.Request(self.base_url + "/chat/completions", data=body, method="POST",
                                          headers={"Content-Type": "application/json",
                                                   "Authorization": "Bearer " + self.key})
@@ -160,14 +156,20 @@ class LLMClient:
     def in_flight(self) -> int:
         return sum(1 for call in self.calls if not call.done())
 
-    def submit(self, tag: str, system: str, user: dict, wallclock_left: float):
-        """Start a call in the background; None when the run's limits say no."""
+    def submit_messages(self, tag: str, messages: list, wallclock_left: float):
+        """Start a background call with a **full message array** (system + 多轮历史). None if limits say no."""
         timeout = min(self.call_timeout, wallclock_left - 30.0)
         if len(self.calls) >= self.max_calls or timeout < 5.0 or self.in_flight() >= self.max_in_flight:
             return None
-        call = Call(self, tag, system, user, timeout)
+        call = Call(self, tag, messages, timeout)
         self.calls.append(call)
         return call
+
+    def submit(self, tag: str, system: str, user: dict, wallclock_left: float):
+        """单轮调用 (system + 一个 JSON user 消息). 保持与 advisor.py 的旧接口兼容."""
+        messages = [{"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(user, separators=(",", ":"))}]
+        return self.submit_messages(tag, messages, wallclock_left)
 
     def collect(self, call):
         """The parsed answer of a finished call (None while running or after a failure). Logs once."""

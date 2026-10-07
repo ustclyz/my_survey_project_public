@@ -207,6 +207,20 @@ class Planner:
         self.blocked: list[tuple[float, float]] = []          # (az, alt) where a hit scored zero
         self.notices: set[tuple[str, str]] = set()
         self.terrain: set[str] = set()
+        # 值班日志给的地形遮挡阈值 (方向 -> 低于此高度角不可观测)。官方公告只给方向,
+        # 不给高度角; 日志里会写"东南的山 32 度"这类具体阈值, 用它可以少走低空废视场。
+        self.terrain_min_alt: dict[str, float] = {}
+        # --- LLM 指令面 (值班日志 / 夜间计划解析出的可执行约束) ------------------------------
+        # 让模型的话真正落到决策上, 而不是"知道了但没法改":
+        #   * llm_prefer            方位 -> 0..1 偏好权重 (给该方位的视场加成)
+        #   * llm_target_boost      目标 ID -> 价值倍率 (日志点名的重点目标)
+        #   * llm_duration_scale    曝光时长倍率 (0.5~2.0; 天气/策略想更短或更长)
+        #   * llm_lambda_scale      时间价格倍率 (越小越愿意花时间把目标打满)
+        # 规避方位复用 extra_avoid / terrain_min_alt, 坏夜复用 bad_forecast。
+        self.llm_prefer: dict[str, float] = {}
+        self.llm_target_boost: dict[str, float] = {}
+        self.llm_duration_scale = 1.0
+        self.llm_lambda_scale = 1.0
         self.extra_avoid: set[str] = set()       # directions an advisor asked to avoid tonight
         self.duration_scale = 1.0
         self.fast_level = 0
@@ -587,6 +601,9 @@ class Planner:
         for direction in self.terrain:
             if direction in DIRECTION_AZ and alt < 50.0 and _az_distance(az, DIRECTION_AZ[direction]) <= 60.0:
                 return 0.0
+        for direction, min_alt in self.terrain_min_alt.items():
+            if direction in DIRECTION_AZ and alt < float(min_alt) and _az_distance(az, DIRECTION_AZ[direction]) <= 60.0:
+                return 0.0
         for kind, direction in self.notices:
             if direction not in DIRECTION_AZ:
                 continue
@@ -609,9 +626,37 @@ class Planner:
         request = self.request_bonus.get(i, 0.0)
         if self.required[i]:
             if f >= REQUIRED_SAFE_FACTOR:
-                return (self.weight[i] * max(0.0, 1.0 - f * f) + request) * damp
-            return (self.weight[i] * (1.0 - f * f) + REQUIRED_BONUS * (1.0 if f < 0.5 else 0.35) + request) * damp
-        return ((0.0 if f >= DONE_FACTOR else self.weight[i] * (1.0 - f * f)) + request) * damp
+                base = (self.weight[i] * max(0.0, 1.0 - f * f) + request) * damp
+            else:
+                base = (self.weight[i] * (1.0 - f * f)
+                        + REQUIRED_BONUS * (1.0 if f < 0.5 else 0.35) + request) * damp
+        else:
+            base = ((0.0 if f >= DONE_FACTOR else self.weight[i] * (1.0 - f * f)) + request) * damp
+        boost = self.llm_target_boost.get(self.ids[i])   # 值班日志点名的重点目标
+        return base * boost if boost else base
+
+    def _direction_preference(self, alt: float, az: float) -> float:
+        """LLM 点名"优先"的方位 -> 给该视场 0..1 的加成权重."""
+        best = 0.0
+        for direction, weight in self.llm_prefer.items():
+            if direction in DIRECTION_AZ and _az_distance(az, DIRECTION_AZ[direction]) <= 45.0 and alt < 75.0:
+                try:
+                    best = max(best, float(weight))
+                except (TypeError, ValueError):
+                    continue
+        return max(0.0, min(1.0, best))
+
+    def _scaled_duration(self, T: int, pick: dict, info: dict, seconds_left: float) -> int:
+        """把 LLM 的 llm_duration_scale 应用到已选时长, 并重新夹到合法/可观测范围内."""
+        try:
+            scale = max(0.5, min(2.0, float(self.llm_duration_scale)))
+        except (TypeError, ValueError):
+            scale = 1.0
+        if abs(scale - 1.0) > 1e-9:
+            T = int(round(T * scale / 30.0) * 30)
+        # 不能超过任何被选目标"仍在地平线上的剩余时间"
+        up = min((info[j][4] for j in pick.values()), default=1e9)
+        return int(max(self.min_exposure, min(self.max_exposure, T, seconds_left, up)))
 
     def _season_plan(self, now: datetime, night_index: int) -> None:
         """Which targets will the season complete? Fill the remaining useful fibre-time with targets in
@@ -794,7 +839,7 @@ class Planner:
             durations = [int(seconds_left)]
         t_long = durations[-1]
         t_mid = durations[len(durations) // 2]
-        lam = self.lambda_frac * self.rate_ema
+        lam = self.lambda_frac * self.rate_ema * self.llm_lambda_scale   # LLM 可调时间价格
         ranked = []
         for i in pool:
             g1, T1 = quick(i, t_long)
@@ -849,7 +894,8 @@ class Planner:
                     continue
                 if total / T > best_rate[0]:
                     best_rate[0] = total / T
-                net = total - lam * T
+                # LLM 点名的"优先方位": 给落在该方位的视场一点加成 (不改变动作合法性)
+                net = (total - lam * T) * (1.0 + 0.25 * self._direction_preference(c_alt, c_az))
                 if found is None or net > found[0]:
                     found = (net, T, pick, total)
             return found
@@ -894,6 +940,7 @@ class Planner:
                 self.log(f"plan none: info={len(info)} ranked={len(ranked)} scale={self.scale:.3f} lam={lam:.4f} best={best and best[:1]}")
             return None
         _, c_alt, c_az, T, pick, _ = best
+        T = self._scaled_duration(T, pick, info, seconds_left)   # LLM 可整体缩放曝光时长
         # program: maximise expected score over the assigned targets
         votes = {"DARK": 0.0, "BRIGHT": 0.0, "BACKUP": 0.0}
         for fib, j in pick.items():

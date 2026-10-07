@@ -129,3 +129,187 @@ def test_duty_log_would_be_detected():
     """长中文 reason 应被识别为值班日志; 短的英文 reason (普通请求) 不应识别."""
     from pro import agent as pro_agent
     assert pro_agent.DUTY_MIN_CHARS <= 200
+
+
+# ---------------------------------------------------------------------------
+# 值班日志: 历史入请求 / 全量状态累积 / 富字段接规划器 / 禁报窗口
+# ---------------------------------------------------------------------------
+
+
+class _FakeCall:
+    def __init__(self, answer):
+        self.answer = answer
+
+    def done(self):
+        return True
+
+
+class _RecordingClient:
+    """记录每次 submit_messages 的完整 messages 数组, 并立即返回预设答案."""
+
+    model = "fake"
+
+    def __init__(self, answers=None):
+        self.requests: list = []
+        self.answers = list(answers or [])
+        self.ok = 0
+        self.failed = 0
+
+    def submit_messages(self, tag, messages, wallclock_left):
+        self.requests.append(messages)
+        return _FakeCall(self.answers.pop(0) if self.answers else None)
+
+    def collect(self, call):
+        return call.answer
+
+
+def _duty_agent(answers=None):
+    from pro.agent import ObserverAgent
+    card = preplan.CardData.from_card("cardA")
+    agent = ObserverAgent(_build_init(card, _load_nights(card)[:1]), rules_only=True)
+    agent.client = _RecordingClient(answers)
+    return agent
+
+
+def test_duty_log_keeps_history_in_llm_request():
+    """目标要求: 历史值班日志必须出现在 LLM 请求的历史记录里, 且状态是全量累积的."""
+    agent = _duty_agent([
+        {"report_utc": ["2026-10-02T01:30:00Z"], "notes": "first"},
+        {"report_utc": ["2026-10-02T01:30:00Z", "2026-10-03T02:00:00Z"], "notes": "second"},
+    ])
+    payload = {"now_utc": "2026-10-02T00:00:00Z"}
+
+    agent.duty_pending = [{"issued_at_utc": "2026-10-02T00:00:00Z", "duty_log": "LOG-ONE"}]
+    agent._duty_tick(payload)
+    assert len(agent.client.requests) == 1
+    first = agent.client.requests[0]
+    assert first[0]["role"] == "system" and "LOG-ONE" in json.dumps(first, ensure_ascii=False)
+
+    agent.duty_pending = [{"issued_at_utc": "2026-10-03T00:00:00Z", "duty_log": "LOG-TWO"}]
+    agent._duty_tick(payload)
+    assert len(agent.client.requests) == 2
+    second = agent.client.requests[1]
+    roles = [m["role"] for m in second]
+    assert roles[0] == "system"
+    assert "assistant" in roles                      # 上一轮回复作为历史一起发
+    blob = json.dumps(second, ensure_ascii=False)
+    assert "LOG-ONE" in blob and "LOG-TWO" in blob   # 新旧日志都在请求里
+    assert len(agent.duty_times) == 1                # 第一轮的全量状态已生效
+
+    agent.duty_pending = [{"issued_at_utc": "2026-10-04T00:00:00Z", "duty_log": "LOG-THREE"}]
+    agent._duty_tick(payload)
+    assert len(agent.duty_times) == 2                # 第二轮的全量状态覆盖并累积
+
+
+def test_duty_log_rich_fields_reach_planner():
+    """日志解析出的规避方向/地形阈值/坏夜/禁报窗口要真正驱动决策."""
+    from pro.skymath import parse_utc
+
+    agent = _duty_agent()
+    agent._apply_duty({
+        "report_utc": [],
+        "no_report_utc": ["2026-10-02T03:00:00Z"],
+        "avoid_directions": ["SW"],
+        "terrain": [{"direction": "SE", "min_alt_deg": 32}],
+        "bad_nights": ["2026-10-20"],
+        "prefer_directions": [{"direction": "E", "weight": 0.8}],
+        "duration_scale": 1.3,
+        "lambda_scale": 0.7,
+        "notes": "keep going",
+    })
+    assert "SW" in agent.planner.extra_avoid
+    assert agent.planner.terrain_min_alt.get("SE") == 32.0
+    assert agent.duty_bad_nights == {"2026-10-20"}
+    assert agent.planner.llm_prefer.get("E") == 0.8
+    assert abs(agent.planner.llm_duration_scale - 1.3) < 1e-9
+    assert abs(agent.planner.llm_lambda_scale - 0.7) < 1e-9
+    # 地形阈值真的进了方向因子
+    assert agent.planner._direction_factor(25.0, 135.0) == 0.0    # SE, 低于 32 度
+    assert agent.planner._direction_factor(60.0, 135.0) > 0.0     # 高于阈值仍可用
+    # 禁报窗口
+    assert agent._in_no_report_window(parse_utc("2026-10-02T03:20:00Z")) is True
+    assert agent._in_no_report_window(parse_utc("2026-10-02T06:00:00Z")) is False
+    # 非法时刻/非法字段不应抛异常
+    agent._apply_duty({"report_utc": ["nope"], "terrain": [{"direction": "XX", "min_alt_deg": "bad"}]})
+    assert agent.duty_times == []
+
+
+def test_llm_directives_actually_change_decisions():
+    """LLM 的旋钮必须真的改变规划器行为 (不是"知道了但改不动")."""
+    agent = _duty_agent()
+    planner = agent.planner
+    agent._apply_duty({"prefer_targets": [planner.ids[0]], "duration_scale": 1.5, "lambda_scale": 0.5,
+                       "prefer_directions": [{"direction": "E", "weight": 0.9}]})
+    assert planner.llm_target_boost.get(planner.ids[0]) == 2.0     # 目标价值被抬高
+    assert planner.value(0) > 0.0
+    assert planner._direction_preference(45.0, 90.0) == 0.9        # E = 方位角 90
+    assert planner._direction_preference(45.0, 270.0) == 0.0
+    info = {0: (45.0, 90.0, 0.8, 0.8, 100000.0, 1.0)}   # info 以目标下标为键
+    assert planner._scaled_duration(600, {0: 0}, info, 1e9) == 900  # 1.5x, 30s 对齐
+    assert planner._scaled_duration(3600, {0: 0}, info, 500) == 500  # 不超剩余窗口
+    # 越界值被夹紧
+    agent._apply_duty({"duration_scale": 99, "lambda_scale": 0.0})
+    assert planner.llm_duration_scale == 2.0 and planner.llm_lambda_scale == 0.3
+
+
+def test_no_report_window_suppresses_false_report():
+    """平场灯/镜盖测试时段即使判据成立也不许报修 (报了算误报)."""
+    agent = _duty_agent()
+    agent._apply_duty({"no_report_utc": ["2026-10-02T03:00:00Z"]})
+    agent._fault_verdict = lambda *a, **k: True      # 强制"判据成立"
+    assert agent._maybe_report(1000.0, {"now_utc": "2026-10-02T03:10:00Z"}) is None
+    out = agent._maybe_report(1000.0, {"now_utc": "2026-10-05T03:10:00Z"})
+    assert out is not None and out["action"] == "report"
+
+
+def test_llm_client_builds_multi_turn_request():
+    """LLM 客户端必须把完整 messages(含多轮历史)原样发给 /chat/completions."""
+    import urllib.request
+    from pro.llm_client import LLMClient
+
+    client = LLMClient(log=lambda *_: None)
+    captured = {}
+
+    class _Resp:
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": "{\"a\": 1}"}}]}).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _fake_urlopen(request, timeout=None):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _Resp()
+
+    original = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen
+    try:
+        messages = [{"role": "system", "content": "S"}, {"role": "user", "content": "U1"},
+                    {"role": "assistant", "content": "A1"}, {"role": "user", "content": "U2"}]
+        out = client._request(messages, 10.0)
+    finally:
+        urllib.request.urlopen = original
+    assert out == {"a": 1}
+    assert [m["role"] for m in captured["body"]["messages"]] == ["system", "user", "assistant", "user"]
+
+
+def test_duty_history_is_trimmed_but_state_survives():
+    """历史超预算时丢弃最早的轮次, 但要把上一版全量状态作为继承放在最前面."""
+    from pro import agent as pro_agent
+
+    agent = _duty_agent()
+    agent.duty_state = {"report_utc": ["2026-10-02T01:30:00Z"], "notes": "carried"}
+    agent.duty_history = [
+        {"role": "user", "content": "x" * 30000},
+        {"role": "assistant", "content": "y" * 30000},
+        {"role": "user", "content": "z" * 30000},
+    ]
+    agent._trim_duty_history()
+    assert agent._duty_chars() <= pro_agent.DUTY_HISTORY_CHARS + len(
+        json.dumps({"carried_state": agent.duty_state, "note": "更早的原始日志已省略; 请以上一版全量状态为准继续累积"},
+                   ensure_ascii=False, separators=(",", ":")))
+    assert agent.duty_history[0]["role"] == "user"
+    assert "carried_state" in agent.duty_history[0]["content"]
