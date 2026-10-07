@@ -76,3 +76,22 @@ def test_ambiguous_model_json_is_rejected(monkeypatch):
     monkeypatch.setattr('urllib.request.urlopen', lambda *a, **k: io.BytesIO(json.dumps(response).encode()))
     with pytest.raises(ValueError, match='ambiguous'):
         c._request('JSON', {}, 3)
+
+
+def test_deepseek_duty_request_has_bounded_reasoning_and_more_output(monkeypatch):
+    c = LLMClient()
+    c.model = "deepseek-flash"
+    c.base_url = "https://api.deepseek.com"
+    captured = []
+    def reply(req, **kwargs):
+        captured.append(json.loads(req.data))
+        return io.BytesIO(json.dumps({'choices': [{'finish_reason': 'stop', 'message': {'content': '{}'}}]}).encode())
+    monkeypatch.setattr('urllib.request.urlopen', reply)
+    c._request('JSON', {'duty_log': 'public handover'}, 3)
+    assert captured[0].get('reasoning_effort') == 'low'
+    assert captured[0]['max_tokens'] >= 16384
+    c._request('JSON', {'night': 'example'}, 3)
+    assert 'reasoning_effort' not in captured[1]
+    c.model = 'another-provider'
+    c._request('JSON', {'duty_log': 'handover'}, 3)
+    assert 'reasoning_effort' not in captured[2]

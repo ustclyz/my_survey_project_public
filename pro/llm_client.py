@@ -141,12 +141,19 @@ class LLMClient:
         self.failed = 0
 
     def _request(self, system: str, user: dict, timeout: float) -> dict:
-        body = json.dumps({
+        payload = {
             "model": self.model,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": json.dumps(user, separators=(",", ":"))}],
             "max_tokens": int(os.environ.get("PRO_LLM_MAX_TOKENS", "8192")),
-        }).encode("utf-8")
+        }
+        # Official DeepSeek defaults to high reasoning, which exhausted the
+        # 8192-token cap on 72 duty calls in the rescue-v3 evaluation.
+        # Scope this change to that provider/task; other advisors stay unchanged.
+        if "duty_log" in user and self.model in {"deepseek-flash", "deepseek-v4-pro"}:
+            payload["reasoning_effort"] = "low"
+            payload["max_tokens"] = int(os.environ.get("PRO_DUTY_MAX_TOKENS", "16384"))
+        body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(self.base_url + "/chat/completions", data=body, method="POST",
                                          headers={"Content-Type": "application/json",
                                                   "Authorization": "Bearer " + self.key})
