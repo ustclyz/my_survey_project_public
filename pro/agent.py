@@ -67,7 +67,8 @@ SCALE_FAULT_BLOCK_KINDS = {"rain", "storm", "overcast"}   # 公告全场下雨/�
 # scale 远低于晴夜模型 (默认 0.15), 就直接判故障并报修 —— 真故障修好后质量立刻恢复,
 # 报对 +100 且能救回大量必观测目标; 普通卡 (A-D) 的 scale 常年 0.6~1.0, 不会误触发。
 SCALE_FAULT_LEVEL = _env("SCALE_FAULT_LEVEL", 0.15)
-SCALE_FAULT_HOURS = _env("SCALE_FAULT_HOURS", 1)
+SCALE_FAULT_HOURS = _env("SCALE_FAULT_HOURS", 2)   # 连续这么多小时的中位 scale 都在下限之下才判故障
+SCALE_REARM_HOURS = _env("SCALE_REARM_HOURS", 6.0)  # 误报后被"封锁", 但质量持续极低这么久就允许再探
 # --- 值班日志 (Hard 模式 A1-D1 的关键) -------------------------------------------------
 # A1-D1 的 observation_request.reason 里附带本站**值班日志**: 它预告"何时动导星相机"
 # —— 那一刻起所有曝光都是废片, 直到有人报修为止, 所以"到点直接报修"; 同时会写平场灯/
@@ -476,17 +477,36 @@ class ObserverAgent:
         notices = getattr(self.planner, "notices", ())
         return any(direction == "ALL" and kind in SCALE_FAULT_BLOCK_KINDS for kind, direction in notices)
 
+    def _scale_recovered(self, hours: float) -> bool:
+        """误报封锁后, 近两小时的中位 scale 是否已回到下限之上 (不依赖会冻结的 E 表)。"""
+        recent = [sorted(v)[len(v) // 2] for h, v in sorted(self.scale_hours.items())
+                  if h >= self.ref_from_hours and v][-2:]
+        return len(recent) >= 2 and min(recent) >= SCALE_FAULT_LEVEL
+
     def _fault_verdict(self, hours: float, payload: dict) -> bool:
         """Hourly E = quality level / band level (planner.e_hours). 1 = consistent; a fault keeps E low."""
         rows = [(hour, night, sorted(v)[len(v) // 2]) for hour, night, v in self.planner.e_hours if hour >= self.ref_from_hours]
         if rows and int(hours) != getattr(self, "_logged_hour", None):
             self._logged_hour = int(hours)
             log(f"pro: E {payload['now_utc']} {rows[-1][2]:.2f} scale {self.planner.scale:.3f} band {self.planner.band_level or 0:.3f}")
-        # 绝对判据必须放在 E 表新鲜度检查**之前**。E 表只在命中分数能对上某个 program 倍率时
-        # 才更新 (planner.band_obs); 导星相机故障会把分数压到 ~0.05x, 对不上任何倍率, 于是
-        # E 表在故障开始两小时后就不再更新 -> 下面的 "rows 过期" 早退会把报修永久锁死。
-        # 实测 A1: 2026-11-14 起质量塌到 0.05, 之后 25 天一次都没报修, 近 90 夜数据全废。
-        if self._scale_fault(hours):
+        # * 绝对判据必须放在 E 表新鲜度检查**之前**。E 表只在命中分数能对上某个 program 倍率时
+        #   才更新 (planner.band_obs); 导星相机故障会把分数压到 ~0.05x, 对不上任何倍率, 于是
+        #   E 表在故障开始两小时后就不再更新 -> "rows 过期" 早退会把报修永久锁死。
+        #   实测 A1: 2026-11-14 起质量塌到 0.05, 之后 25 天一次都没报修, 近 90 夜数据全废。
+        # * 但误报后的"封锁"必须保留, 否则 A-D 上偶发的一小时低质量会变成连续误报
+        #   (报 A 实测有 11 个小时 scale<0.15, 卡 D 有 26 个) -> 每次 -150。封锁的解除改用
+        #   scale 自身判断 (E 表在故障期不可用), 且持续极低太久时允许再探一次。
+        scale_fault = self._scale_fault(hours)
+        if self.episode_blocked:
+            if self._scale_recovered(hours):
+                self.episode_blocked = False
+                log(f"pro: quality recovered at {payload['now_utc']}; probing re-armed")
+            elif scale_fault and hours - self.blocked_at_hour >= SCALE_REARM_HOURS:
+                self.episode_blocked = False
+                log(f"pro: quality stuck below {SCALE_FAULT_LEVEL} for {SCALE_REARM_HOURS}h; probing re-armed")
+            else:
+                return False
+        if scale_fault:
             if self._scale_fault_blocked():
                 return False
             log(f"pro: scale {self.planner.scale:.3f} < {SCALE_FAULT_LEVEL} for {SCALE_FAULT_HOURS}h "
