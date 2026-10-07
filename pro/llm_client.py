@@ -26,6 +26,45 @@ DEFAULT_MODEL = "k3"
 _JSON_OBJECT = re.compile(r"\{.*\}", re.S)
 
 
+def _extract_json(text: str):
+    """从模型回复里取一个 JSON 对象.
+
+    先试整段贪心匹配; 不行再扫描所有**括号平衡**的候选, 从后往前找第一个能解析的
+    (推理型模型的 reasoning_content 里常混着若干 JSON 片段, 真正答案在最后)。
+    """
+    if not text:
+        return None
+    match = _JSON_OBJECT.search(text)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict):
+                return parsed
+        except (ValueError, TypeError):
+            pass
+    depth = 0
+    start = None
+    candidates = []
+    for index, char in enumerate(text):
+        if char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidates.append(text[start:index + 1])
+                start = None
+    for candidate in reversed(candidates):
+        try:
+            parsed = json.loads(candidate)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
 def _prefix_order() -> list:
     """候选密钥前缀, 按优先级排列.
 
@@ -144,13 +183,13 @@ class LLMClient:
                                                   "Authorization": "Bearer " + self.key})
         with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
-        text = data["choices"][0]["message"]["content"] or ""
-        match = _JSON_OBJECT.search(text)
-        if not match:
+        message = data["choices"][0]["message"]
+        parsed = _extract_json(message.get("content") or "")
+        if parsed is None:
+            # 推理型模型可能把答案放在 reasoning_content, content 为空
+            parsed = _extract_json(message.get("reasoning_content") or "")
+        if parsed is None:
             raise ValueError("no JSON object in the reply")
-        parsed = json.loads(match.group(0))
-        if not isinstance(parsed, dict):
-            raise ValueError("reply is not a JSON object")
         return parsed
 
     def in_flight(self) -> int:

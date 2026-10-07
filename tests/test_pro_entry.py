@@ -313,3 +313,45 @@ def test_duty_history_is_trimmed_but_state_survives():
                    ensure_ascii=False, separators=(",", ":")))
     assert agent.duty_history[0]["role"] == "user"
     assert "carried_state" in agent.duty_history[0]["content"]
+
+
+def test_llm_extract_json_handles_reasoning_models():
+    """推理型模型 content 为空、答案在 reasoning_content 时也要能解析出来."""
+    from pro.llm_client import _extract_json
+
+    assert _extract_json('{"a": 1}') == {"a": 1}
+    assert _extract_json('前言 {"a": 1} 后语') == {"a": 1}
+    # 推理文本里混着多个 JSON 片段: 取最后一个能解析的
+    messy = '我先列个草稿 {"draft": 1} 不对; 最终答案 {"report_utc": ["2026-10-02T01:30:00Z"]}'
+    assert _extract_json(messy) == {"report_utc": ["2026-10-02T01:30:00Z"]}
+    assert _extract_json("没有 JSON") is None
+    assert _extract_json("") is None
+
+
+def test_llm_client_uses_reasoning_content_when_content_empty():
+    """端到端: content 为空 + reasoning_content 有 JSON -> 仍然拿到答案."""
+    import urllib.request
+    from pro.llm_client import LLMClient
+
+    client = LLMClient(log=lambda *_: None)
+
+    class _Resp:
+        def read(self):
+            return json.dumps({"choices": [{"message": {
+                "content": "",
+                "reasoning_content": '思考中... 最终 {"report_utc": ["2026-10-02T01:30:00Z"]}',
+            }}]}).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    original = urllib.request.urlopen
+    urllib.request.urlopen = lambda request, timeout=None: _Resp()
+    try:
+        out = client._request([{"role": "system", "content": "S"}], 10.0)
+    finally:
+        urllib.request.urlopen = original
+    assert out == {"report_utc": ["2026-10-02T01:30:00Z"]}
