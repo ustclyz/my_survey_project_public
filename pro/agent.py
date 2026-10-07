@@ -133,7 +133,13 @@ QUAKE_TAIL_HOURS = _env("QUAKE_TAIL_HOURS", 24.0)   # the earthquake period last
 PAID_SPACING_HOURS = 20.0
 MIN_REPORT_SPACING_HOURS = 1.0
 # --- pace ---
-PACE_SAFETY = _env("PACE_SAFETY", 0.75)
+PACE_SAFETY = _env("PACE_SAFETY", 0.85)
+# 实测 (卡 A/B/C, eval 1fdc6d60): pace 在 level 0 与 level 1 之间每轮来回跳, 约一半曝光是用
+# level 1 规划出来的 —— 而 level 1 只有 3 个 anchor 且**完全不做指向微调** (level 0 是
+# 12 个 anchor + 最多 20 个密集补丁 + 局部细化), 粗规划直接把最耗时的那半场巡天做差了。
+# 同时卡 A-D 结束时 CPU 只用了 60%~86% (survey_complete, 不是预算耗尽), 说明预算本来就有余。
+# 这里给降级加迟滞, 只有实测成本明显超预算才降级。
+PACE_HYSTERESIS = _env("PACE_HYSTERESIS", 1.25)
 # --- model ---
 MODEL_WAIT_MAX = _env("MODEL_WAIT_MAX", 20.0)   # longest wait for the night's model answers (s)
 MODEL_FAULT_HIGH = _env("MODEL_FAULT_HIGH", 0.6)  # fault review at or above this: report more readily tonight
@@ -382,7 +388,8 @@ class ObserverAgent:
             self.planner.fast_level = FIXED_LEVEL
             return
         level = 0
-        while level < 3 and (self.cost_ema[level] > cpu_budget or self.wall_ema[level] > wall_budget):
+        while level < 3 and (self.cost_ema[level] > cpu_budget * PACE_HYSTERESIS
+                             or self.wall_ema[level] > wall_budget * PACE_HYSTERESIS):
             level += 1
         if min(cpu_left, wall_left) < 15.0:
             level = 4
