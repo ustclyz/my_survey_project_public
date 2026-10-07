@@ -87,3 +87,45 @@ def test_entry_survives_empty_stdin():
                           capture_output=True, text=True, encoding="utf-8", env=_env(), timeout=120)
     assert proc.returncode == 0
     assert proc.stdout.strip() == ""
+
+
+class _FakeClient:
+    """Just enough of LLMClient for the duty-log scheduling test."""
+
+    model = "fake"
+
+    def submit(self, tag, system, user, wallclock_left):
+        return None
+
+    def collect(self, call):
+        return None
+
+
+def test_duty_log_schedules_a_report():
+    """值班日志 (Hard 模式 A1-D1) 解析出的报修时刻要能触发 report 动作."""
+    from pro.agent import ObserverAgent
+    from pro.skymath import parse_utc
+
+    card = preplan.CardData.from_card("cardA")
+    init_payload = _build_init(card, _load_nights(card)[:1])
+    agent = ObserverAgent(init_payload, rules_only=True)
+    agent.client = _FakeClient()                      # 让排程逻辑认为是"有模型"模式
+    agent._apply_duty({"report_utc": ["2026-10-02T01:30:00Z", "not-a-time"]})
+    assert len(agent.duty_times) == 1                 # 非法时刻被丢弃
+    # 未到点 -> 不报
+    assert agent._due_report(parse_utc("2026-10-02T01:00:00Z")) is None
+    # 到点 -> 报
+    action = agent._due_report(parse_utc("2026-10-02T02:00:00Z"))
+    assert action is not None and action["action"] == "report"
+    # 已报过的时刻不会重复报
+    assert agent._due_report(parse_utc("2026-10-02T02:30:00Z")) is None
+    # 连续 report 达到上限时暂停, 等待一次观测刷新计数
+    agent.duty_times.append(parse_utc("2026-10-03T01:00:00Z"))
+    agent.consecutive_reports = 3
+    assert agent._due_report(parse_utc("2026-10-03T02:00:00Z")) is None
+
+
+def test_duty_log_would_be_detected():
+    """长中文 reason 应被识别为值班日志; 短的英文 reason (普通请求) 不应识别."""
+    from pro import agent as pro_agent
+    assert pro_agent.DUTY_MIN_CHARS <= 200
