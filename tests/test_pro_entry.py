@@ -443,3 +443,37 @@ def test_llm_extract_json_picks_the_real_answer_not_a_draft():
     # 其它环节的答案字段也要认得
     assert _extract_json('思考... {"bad_night": true, "avoid_directions": ["SW"]}') == {
         "bad_night": True, "avoid_directions": ["SW"]}
+
+
+def test_llm_salvages_report_times_from_a_truncated_reply():
+    """relay 真机实测: 回复被截断 -> JSON 不完整, 仍要按 report_utc 段落抢救出时刻."""
+    import urllib.request
+    from pro.llm_client import _salvage_report_times, _normalise_stamp, LLMClient
+
+    truncated = ('{"report_utc": ["2026-10-02T01:30:00Z", "2026-10-04T03:15:00Z", '
+                 '"2026-10-05T05:00:00Z"], "no_report_utc": ["2026-10-02T03')
+    assert _salvage_report_times(truncated) == [
+        "2026-10-02T01:30:00Z", "2026-10-04T03:15:00Z", "2026-10-05T05:00:00Z"]
+    assert _normalise_stamp("2026-10-05T05:00") == "2026-10-05T05:00:00Z"
+
+    client = LLMClient(log=lambda *_: None)
+
+    class _Resp:
+        def read(self):
+            return json.dumps({"choices": [{"message": {
+                "content": truncated, "reasoning_content": "Let me think..."}}]}).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    original = urllib.request.urlopen
+    urllib.request.urlopen = lambda request, timeout=None: _Resp()
+    try:
+        out = client._request([{"role": "user", "content": "x"}], 10.0, 8192)
+    finally:
+        urllib.request.urlopen = original
+    assert out.get("report_utc") == [
+        "2026-10-02T01:30:00Z", "2026-10-04T03:15:00Z", "2026-10-05T05:00:00Z"]

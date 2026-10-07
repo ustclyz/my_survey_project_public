@@ -85,7 +85,7 @@ DUTY_NO_REPORT_HOURS = _env("DUTY_NO_REPORT_HOURS", 1.0)  # 平场灯/镜盖测�
 DUTY_REPORT_MIN_LIKELY = _env("DUTY_REPORT_MIN_LIKELY", 0.5)  # 采纳"立即报修"所需的最低把握度
 # 值班日志要解密(凯撒/摩斯/唱名)并输出全量状态, 2000 token 会被推理吃光导致 content 为空/截断
 # (实测 v10/v11 共 55 次调用 100% 失败) —— 这里给它单独放大输出预算。
-DUTY_MAX_TOKENS = _env("DUTY_MAX_TOKENS", 6000)
+DUTY_MAX_TOKENS = _env("DUTY_MAX_TOKENS", 8192)
 DUTY_SIMPLE_RETRY = _env("DUTY_SIMPLE_RETRY", 1)     # 全量调用失败时降级重试 (只问报修时刻)
 DUTY_SIMPLE_SYSTEM = (
     "你是天文台的值班日志解析器。输入是一段中/日/英文混写的值班日志(可能用凯撒密码/摩斯电码/"

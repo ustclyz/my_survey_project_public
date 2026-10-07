@@ -29,6 +29,38 @@ _JSON_OBJECT = re.compile(r"\{.*\}", re.S)
 _ANSWER_KEYS = ("report_utc", "no_report_utc", "avoid_directions", "terrain", "bad_nights",
                 "prefer_directions", "prefer_targets", "duration_scale", "lambda_scale",
                 "report_now", "fault_likely", "bad_night", "avoid", "report", "action", "reason")
+_ISO_UTC = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|\+00:00)?")
+_NEXT_KEY = re.compile(r'"(?:no_report_utc|avoid_directions|terrain|bad_nights|prefer_directions|'
+                       r'prefer_targets|duration_scale|lambda_scale|report_now|fault_likely|notes|reason)"\s*:')
+
+
+def _salvage_report_times(text: str) -> list:
+    """从**被截断**的回复里抢救 report_utc 里的时刻.
+
+    实测 (relay 真机回放): 模型把答案放在开头, 但长推理会把输出预算吃光 -> JSON 断在半路,
+    只有嵌套的小对象能解析出来, 结果"解析成功但全空"。这里直接按 `report_utc` 段落抓 ISO 时刻。
+    """
+    for marker in ('"report_utc"', "report_utc"):
+        index = text.find(marker)
+        if index >= 0:
+            break
+    else:
+        return []
+    tail = text[index + len(marker):]
+    stop = _NEXT_KEY.search(tail)
+    segment = tail[: stop.start()] if stop else tail[:20000]
+    return _ISO_UTC.findall(segment)
+
+
+def _normalise_stamp(stamp: str) -> str:
+    value = stamp.strip().replace(" ", "T")
+    if value.endswith("+00:00"):
+        value = value[:-6]
+    if not value.endswith("Z"):
+        value += "Z"
+    if len(value) == len("2026-10-02T01:30Z"):
+        value = f"{value[:-1]}:00Z"
+    return value
 
 
 def _balanced_objects(text: str) -> list:
@@ -216,18 +248,29 @@ class LLMClient:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
         message = data["choices"][0]["message"]
+        raw = (message.get("content") or "") + "\n" + (message.get("reasoning_content") or "")
         parsed = _extract_json(message.get("content") or "")
         if parsed is None:
             # 推理型模型可能把答案放在 reasoning_content, content 为空
             parsed = _extract_json(message.get("reasoning_content") or "")
+        salvaged = [_normalise_stamp(s) for s in _salvage_report_times(raw)]
         if parsed is None:
-            # 失败时把原始回复(截断)打到 stderr: 这是排查"模型到底回了什么"的唯一线索
-            raw = (message.get("content") or "") or (message.get("reasoning_content") or "")
-            self.log(f"llm: 回复里没有 JSON, 原文前 400 字: {raw[:400]!r}")
-            raise ValueError("no JSON object in the reply")
+            if salvaged:
+                # JSON 被截断到连一个完整对象都没有: 只抢救报修时刻 (这是最值钱的信息)
+                self.log(f"llm: JSON 不完整, 从原文抢救出 {len(salvaged)} 个报修时刻")
+                parsed = {"report_utc": list(dict.fromkeys(salvaged))}
+            else:
+                # 失败时把原始回复(截断)打到 stderr: 排查"模型到底回了什么"的唯一线索
+                self.log(f"llm: 回复里没有 JSON, 原文前 400 字: {raw[:400]!r}")
+                raise ValueError("no JSON object in the reply")
         if not any(key in parsed for key in _ANSWER_KEYS):
-            raw = (message.get("content") or "") or (message.get("reasoning_content") or "")
             self.log(f"llm: 解析到的对象没有已知字段 {sorted(parsed)[:6]}, 原文前 300 字: {raw[:300]!r}")
+        # 截断抢救: 只要报修时刻缺失, 就从原文里按 report_utc 段落直接抓 ISO 时刻
+        if not isinstance(parsed.get("report_utc"), list) or not parsed.get("report_utc"):
+            if salvaged:
+                merged = list(dict.fromkeys([*salvaged, *(parsed.get("report_utc") or [])]))
+                parsed = {**parsed, "report_utc": merged}
+                self.log(f"llm: 回复被截断, 从原文抢救出 {len(salvaged)} 个报修时刻")
         return parsed
 
     def in_flight(self) -> int:
