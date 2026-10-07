@@ -57,3 +57,26 @@ def test_healthy_scale_never_reports():
     agent.planner.scale = 0.8
     agent.scale_hours = {4: [0.8, 0.8], 5: [0.8, 0.8]}
     assert agent._fault_verdict(5.0, {"now_utc": "2026-10-02T05:00:00Z"}) is False
+
+
+def test_false_report_blocks_immediate_repeats():
+    """一次误报后必须封锁: A-D 上一小时的低质量不能变成连续误报 (每次 -150)."""
+    agent = _agent()
+    _frozen_fault(agent)
+    agent.episode_blocked = True
+    agent.blocked_at_hour = 3
+    assert agent._fault_verdict(5.0, {"now_utc": "2026-10-02T05:00:00Z"}) is False
+    # 但质量确实回来了 -> 解锁
+    agent.planner.scale = 0.8
+    agent.scale_hours = {4: [0.8], 5: [0.8]}
+    assert agent._fault_verdict(5.0, {"now_utc": "2026-10-02T05:00:00Z"}) is False
+    assert agent.episode_blocked is False
+
+
+def test_stuck_quality_rearms_a_probe_after_a_long_block():
+    agent = _agent()
+    _frozen_fault(agent, hours=30.0)
+    agent.episode_blocked = True
+    agent.blocked_at_hour = 3
+    agent.scale_hours = {29: [0.05], 30: [0.05]}
+    assert agent._fault_verdict(30.0, {"now_utc": "2026-10-03T06:00:00Z"}) is True
