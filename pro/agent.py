@@ -87,6 +87,9 @@ DUTY_REPORT_MIN_LIKELY = _env("DUTY_REPORT_MIN_LIKELY", 0.5)  # 采纳"立即报
 # (实测 v10/v11 共 55 次调用 100% 失败) —— 这里给它单独放大输出预算。
 DUTY_MAX_TOKENS = _env("DUTY_MAX_TOKENS", 8192)
 DUTY_SIMPLE_RETRY = _env("DUTY_SIMPLE_RETRY", 1)     # 全量调用失败时降级重试 (只问报修时刻)
+# 降级重试用的确定性预筛: 只保留与"导星相机/平场灯/报修"有关的行, 把密文噪音(天气/寒潮/隔壁站)
+# 删掉。实测平台模型(deepseek-flash)在全量提示下 28 次全返回空列表, 预筛能显著降低难度。
+DUTY_FOCUS_RE = re.compile(r"导星|ガイダー|guider|平场|镜盖|flat|cover|报修|報修", re.I)
 DUTY_SIMPLE_SYSTEM = (
     "你是天文台的值班日志解析器。输入是一段中/日/英文混写的值班日志(可能用凯撒密码/摩斯电码/"
     "唱名伪装)。你只做一件事: 找出所有\"动导星相机\"的时刻 —— 从那一刻起所有曝光都是废片, "
@@ -751,6 +754,10 @@ class ObserverAgent:
         if self.client is None or not self.duty_pending:
             return
         text = "\n\n".join(str(e.get("duty_log") or "") for e in self.duty_pending)
+        # 确定性预筛: 只留与故障/平场测试相关的行 (无匹配时退回全文)
+        focused = [line for line in text.splitlines() if DUTY_FOCUS_RE.search(line)]
+        if focused:
+            text = "\n".join(focused)
         user = json.dumps({"duty_log": text, "local_utc_offset_hours": self.utc_offset_hours,
                            "now_utc": payload.get("now_utc")}, ensure_ascii=False)
         messages = [{"role": "system", "content": DUTY_SIMPLE_SYSTEM},
