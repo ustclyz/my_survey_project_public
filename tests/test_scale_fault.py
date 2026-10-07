@@ -32,10 +32,19 @@ def _agent() -> ObserverAgent:
 
 def _frozen_fault(agent: ObserverAgent, hours: float = 5.0) -> None:
     """复刻故障持续中的状态: 质量塌到 0.05, E 表已停止更新."""
+    agent.hard_mode = True          # 绝对判据只在 Hard 模式 (A1-D1) 启用
     agent.ref_from_hours = hours - 3.0
     agent.planner.e_hours = []
     agent.planner.scale = 0.05
     agent.scale_hours = {int(hours) - 1: [0.05, 0.05], int(hours): [0.05, 0.05]}
+
+
+def test_normal_cards_never_use_the_aggressive_criterion():
+    """普通卡 (A-D) 没有值班日志, 低质量按天气处理, 避免连续误报 (-150/次)."""
+    agent = _agent()
+    _frozen_fault(agent)
+    agent.hard_mode = False
+    assert agent._fault_verdict(5.0, {"now_utc": "2026-10-02T05:00:00Z"}) is False
 
 
 def test_scale_fault_reports_even_when_e_table_is_frozen():
