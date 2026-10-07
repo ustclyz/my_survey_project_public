@@ -51,7 +51,10 @@ E_RECOVER = _env("E_RECOVER", 0.95)       # after a false probe, wait until E is
 MAX_PAID_FALSE = _env("MAX_PAID", 6)
 PERSIST_NIGHTS = _env("PERSIST_NIGHTS", 3)
 E_PAID_STEP = _env("E_PAID_STEP", 0.05)   # ... minus this per paid false probe so far
-MAX_FALSE_REPORTS = 8
+# 8 会在"快速报修"下过早撞顶: 实测 v6 在卡 A1 已用掉 7 次误报, 一旦到 8 次就**永久
+# 停止报修** -> 后面所有真故障都无法修复, 直接灾难。误报在每次报对后的免罚额度内是
+# 免费的 (free_allowance=2), 只有超出的才 -150, 所以放宽总次数上限是安全的。
+MAX_FALSE_REPORTS = 40
 # 绝对质量下限的故障判据 (Hard 模式卡的关键). 官方 pro 的 E = 质量/档位 判据在"档位
 # 估计跟着质量一起塌缩"时会失效 (E 恒为 ~1), 仪器故障就长期发现不了。实测卡 A1:
 # 首夜后质量从 Q~0.6 崩到 ~0.004 并持续 100+ 夜, 而 agent 只报修 3 次 (间隔约 30 夜),
@@ -59,7 +62,7 @@ MAX_FALSE_REPORTS = 8
 # scale 远低于晴夜模型 (默认 0.15), 就直接判故障并报修 —— 真故障修好后质量立刻恢复,
 # 报对 +100 且能救回大量必观测目标; 普通卡 (A-D) 的 scale 常年 0.6~1.0, 不会误触发。
 SCALE_FAULT_LEVEL = _env("SCALE_FAULT_LEVEL", 0.15)
-SCALE_FAULT_HOURS = _env("SCALE_FAULT_HOURS", 2)
+SCALE_FAULT_HOURS = _env("SCALE_FAULT_HOURS", 1)
 # The participant guide: an earthquake (announced in the bulletin) lowers instrument efficiency, the loss fades
 # night by night, and a report does not repair it. So E drops right after an earthquake are not reportable, and
 # while its effect may last only a new step down in E (a fresh drop from the preceding hours) is fault evidence.
