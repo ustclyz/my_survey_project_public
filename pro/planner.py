@@ -90,19 +90,6 @@ PLAN_Q = _env("PLAN_Q", 0.7)                  # typical quality for the season p
 KAPPA = _env("KAPPA", 1.0)                    # convex shaping of science value (1 = linear)
 REQUIRED_SAFE_FACTOR = 0.62                   # a required target counts as safe at this estimated factor
 DONE_FACTOR = 0.95                            # other targets are done at this factor
-# Hard-mode 修正 A: 天空质量下限.
-# 官方 pro 对必观测目标的奖励按"当前估计质量下的达标概率"给。一旦天空质量被压低
-# (仪器故障 / 未公告坏天气 / Hard 事件), 概率估计趋近 0, 规划器就**彻底放弃**必观测
-# 目标 —— 实测卡 A1: 1500 个必观测只完成约 750 个, 直接 -37,700 罚分, 总分被拖成负数。
-# 但"漏一个必观测 -50"远高于一次曝光的机会成本 (约 1 分), 而好窗口是间歇出现的
-# (实测约 11% 的曝光落在高质量时段, 落到就能一次完成整场 16 个目标), 因此只要"在
-# 正常天空下这个目标能达标"就值得持续重试。这里给**质量估计**设下限 (而不是给概率设
-# 下限), 这样概率仍然随曝光时长 T 单调上升, 规划器才会为必观测目标选长曝光。
-# (早先版本的"概率下限"是常数, 会让规划器为了省 λ·T 而选 300s 短曝光, 反而更差。)
-REQUIRED_SCALE_FLOOR = _env("REQUIRED_SCALE_FLOOR", 0.5)
-# Hard-mode 修正 B: 必观测轮转. 反复失败的目标要逐步让位给还没试过的目标, 否则规划器
-# 会永久锚定同几个目标, 既浪费观测又饿死其它必观测 (实测 alpha: req_missing 0 -> 31)。
-REQUIRED_ATTEMPT_DAMP = _env("REQUIRED_ATTEMPT_DAMP", 0.85)
 # --- pointing offset (Hard-mode cards: a fixed, unannounced offset; its size is not published) ---
 OFFSET_STEPS = 16                             # coarse grid half-width in steps of pitch/12 (about a third of the field);
                                               # the grid widens by half whenever the best offset sits on its edge
@@ -623,9 +610,7 @@ class Planner:
         if self.required[i]:
             if f >= REQUIRED_SAFE_FACTOR:
                 return (self.weight[i] * max(0.0, 1.0 - f * f) + request) * damp
-            rotate = REQUIRED_ATTEMPT_DAMP ** self.attempts[i]
-            return (self.weight[i] * (1.0 - f * f) + REQUIRED_BONUS * (1.0 if f < 0.5 else 0.35)
-                    + request) * damp * rotate
+            return (self.weight[i] * (1.0 - f * f) + REQUIRED_BONUS * (1.0 if f < 0.5 else 0.35) + request) * damp
         return ((0.0 if f >= DONE_FACTOR else self.weight[i] * (1.0 - f * f)) + request) * damp
 
     def _season_plan(self, now: datetime, night_index: int) -> None:
@@ -771,15 +756,14 @@ class Planner:
             if reach < PARTIAL_DONE and self.planned[i] and self.last_night[i] - night_index >= PARTIAL_NIGHTS:
                 g *= PARTIAL_DISCOUNT   # it will be completed later: this partial exposure would be wasted
             if self.required[i] and self.factor[i] < 0.5:
-                scale_req = max(self.scale, REQUIRED_SCALE_FLOOR)
-                raw = self.flux[i] * T * model * scale_req / self.f0t0 / 0.5 * self.req_calib.get(i, 1.0)
-                p = min(1.0, max(0.0, (raw - REQ_P_LO) / (REQ_P_HI - REQ_P_LO)))
+                raw = self.flux[i] * T * model * self.scale / self.f0t0 / 0.5 * self.req_calib.get(i, 1.0)
+                bonus = REQUIRED_BONUS * min(1.0, max(0.0, (raw - REQ_P_LO) / (REQ_P_HI - REQ_P_LO)))
                 target_best = self.best_future_model(i, night_index) if REQ_CALENDAR else self.ideal_model[i]
                 if REQ_TIMING and model < REQ_TIMING * target_best and self.last_night[i] - night_index >= REQ_TIMING_NIGHTS:
-                    p *= REQ_TIMING_DISCOUNT       # a better moment for this target will come
+                    bonus *= REQ_TIMING_DISCOUNT   # a better moment for this target will come
                 if self.bad_forecast and self.last_night[i] - night_index >= REQ_TIMING_NIGHTS:
-                    p *= FORECAST_DISCOUNT         # tonight is forecast bad over the whole sky
-                g += REQUIRED_BONUS * p
+                    bonus *= FORECAST_DISCOUNT     # tonight is forecast bad over the whole sky
+                g += bonus
             if i in self.request_bonus:
                 threshold = self.request_threshold.get(i, 0.5)
                 raw = self.flux[i] * T * model * self.scale / self.f0t0 / max(1e-6, threshold)
@@ -798,8 +782,7 @@ class Planner:
             if reach < PARTIAL_DONE and self.planned[i] and self.last_night[i] - night_index >= PARTIAL_NIGHTS:
                 g *= PARTIAL_DISCOUNT
             if self.required[i] and self.factor[i] < 0.5:
-                scale_req = max(self.scale, REQUIRED_SCALE_FLOOR)
-                raw = self.flux[i] * T * model * scale_req / self.f0t0 / 0.5
+                raw = self.flux[i] * T * model * self.scale / self.f0t0 / 0.5
                 g += REQUIRED_BONUS * min(1.0, max(0.0, (raw - REQ_P_LO) / (REQ_P_HI - REQ_P_LO)))
             if i in self.request_bonus:
                 raw = self.flux[i] * T * model * self.scale / self.f0t0 / max(1e-6, self.request_threshold.get(i, 0.5))
