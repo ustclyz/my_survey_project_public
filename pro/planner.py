@@ -48,7 +48,19 @@ def _env(name: str, default):
 
 
 # --- search -------------------------------------------------------------------------------------------
-LAMBDA_FRAC = _env("LAMBDA_FRAC", 0.6)        # price of telescope time, as a share of the recent best gain rate
+# Price of telescope time, as a share of the recent best gain rate.
+#
+# The pro kernel used 0.6, which over-prices time: it drops faint/low-value targets
+# whose marginal gain is below lam*T even when the night and the CPU budget are far
+# from exhausted (local end-to-end sims end at 300-600 of the 900 CPU seconds).
+# That shows up as poor coverage on the wide cards. Lowering the price keeps the
+# same field/duration search but stops throwing away usable observing time.
+# Local A/B (tools/pro_score_sim.py, synthetic weather, same seed per card):
+#   cardA 0.60 -> 23222.6 | 0.45 -> 24364.8 | 0.30 -> 25175.9 | 0.20 -> 25146.7
+#   cardD 0.60 -> 27035.6 | 0.45 -> 28555.0 | 0.30 -> 30279.4
+#   cardB 0.60 -> -3188.8 | 0.45 ->   276.3   (required_missing 530 -> 476)
+# 0.30 is the flat part of the curve on card A and the best on card D.
+LAMBDA_FRAC = _env("LAMBDA_FRAC", 0.30)       # price of telescope time, as a share of the recent best gain rate
 LAMBDA_EMA = _env("LAMBDA_EMA", 0.03)
 SCARCITY_REF = _env("SCARCITY_REF", 0.86)     # tuning constant: scarcity at which time is priced fully
 SCARCITY_POWER = _env("SCARCITY_POWER", 1.0)  # time price x min(1, scarcity / SCARCITY_REF) ** power
