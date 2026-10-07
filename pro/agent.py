@@ -59,7 +59,7 @@ MAX_FALSE_REPORTS = 8
 # scale 远低于晴夜模型 (默认 0.15), 就直接判故障并报修 —— 真故障修好后质量立刻恢复,
 # 报对 +100 且能救回大量必观测目标; 普通卡 (A-D) 的 scale 常年 0.6~1.0, 不会误触发。
 SCALE_FAULT_LEVEL = _env("SCALE_FAULT_LEVEL", 0.15)
-SCALE_FAULT_HOURS = _env("SCALE_FAULT_HOURS", 3)
+SCALE_FAULT_HOURS = _env("SCALE_FAULT_HOURS", 2)
 # The participant guide: an earthquake (announced in the bulletin) lowers instrument efficiency, the loss fades
 # night by night, and a report does not repair it. So E drops right after an earthquake are not reportable, and
 # while its effect may last only a new step down in E (a fresh drop from the preceding hours) is fault evidence.
@@ -67,7 +67,7 @@ QUAKE_HOLD_HOURS = _env("QUAKE_HOLD_HOURS", 12.0)   # no probes this long after 
 QUAKE_STEP = _env("QUAKE_STEP", 0.8)                # step: median E of the last 3 rows < this x the 9 rows before
 QUAKE_TAIL_HOURS = _env("QUAKE_TAIL_HOURS", 24.0)   # the earthquake period lasts this long after its last notice
 PAID_SPACING_HOURS = 20.0
-MIN_REPORT_SPACING_HOURS = 2.0
+MIN_REPORT_SPACING_HOURS = 1.0
 # --- pace ---
 PACE_SAFETY = _env("PACE_SAFETY", 0.75)
 # --- model ---
