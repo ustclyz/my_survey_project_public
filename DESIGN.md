@@ -179,6 +179,6 @@ pro/                               ★ 线上运行的全部代码（agent / pla
 tools/                             本地仿真与评测工具（local_scorer / pro_sim / duty_replay / check_duty_maintenance / pack_min …）
 tests/                             规划器、协议、入口、值班日志回归（87 项）
 cards/                             公开输入：cardA–D 与练习卡 α/β/γ/δ
-reports/                           实验记录（含被否决方案）
+reports/                           静态检查与实验记录
 planner.py / preplan.py / …        早期自研内核，本地实验保留，线上不用
 ```
