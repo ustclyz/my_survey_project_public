@@ -79,6 +79,14 @@ EDGE_MARGIN_DEG = _env("EDGE_MARGIN_DEG", 0.04)   # keep targets this far inside
 DURATIONS = (300, 450, 600, 750, 900, 1200, 1500, 1800, 2400, 3000, 3600)
 LEVEL_DURATIONS = (DURATIONS, (300, 600, 900, 1200, 1800, 2400, 3600), (450, 900, 1800, 3600), (900, 1800))
 MIN_T = _env("MIN_T", 0)                      # shortest exposure considered (unless the night is ending)
+# --- "打满"曝光时长 -------------------------------------------------------------------------------
+# 平台实测 (66ff4e98 的四张卡): 中位曝光 450~1200 s, 但让本视场所有目标都达到因子 1 需要
+# 1253~3538 s; 结果是 54%~60% 的科学权重只拿到部分因子。规则写明"每个目标只算最好的一次",
+# 所以短曝光是永久丢分 —— 选出视场后, 若把曝光拉长到"刚好打满本视场"能显著提高这次曝光的
+# 总增益, 就直接采用那个时长 (绕过时间价格算出来的较短时长)。
+SAT_STRETCH = _env("SAT_STRETCH", 1)            # 0 = 关闭, 退回原行为
+SAT_MIN_GAIN = _env("SAT_MIN_GAIN", 1.05)       # 拉长后本视场总增益至少提高这么多才拉长
+SAT_MAX_FACTOR = _env("SAT_MAX_FACTOR", 6.0)    # 最多拉长到原时长的几倍
 MIN_VISIBLE_SECONDS = 600
 ALT_MARGIN_DEG = 0.6                          # keep targets this far above the altitude limit
 # --- value --------------------------------------------------------------------------------------------
@@ -910,6 +918,34 @@ class Planner:
                 net = (total - lam * T) * (1.0 + 0.25 * self._direction_preference(c_alt, c_az))
                 if found is None or net > found[0]:
                     found = (net, T, pick, total)
+            if SAT_STRETCH and found is not None and found[2]:
+                # 拉长到"刚好打满本视场": 需要的时长由视场里最暗的那根光纤决定。
+                # 这一步故意不看时间价格 (价格只用来在视场之间排序), 只比较这次曝光的原始增益。
+                _, T0, pick0, total0 = found
+                for _ in range(2):                      # 一次迭代: 掉出高度角窗口的目标不再计入
+                    need = 0.0
+                    for j in pick0.values():
+                        m0j, m1j = full(j)[2], full(j)[3]
+                        model_j = m0j + (m1j - m0j) * min(1.0, T0 / 3600.0)
+                        need = max(need, self.f0t0 / (max(self.flux[j], 1e-3) * model_j * scale))
+                    t_sat = int(min(self.max_exposure, need, seconds_left))
+                    t_sat = int(max(60, round(t_sat / 30.0) * 30))
+                    if not (T0 < t_sat <= T0 * SAT_MAX_FACTOR):
+                        break
+                    total = 0.0
+                    pick = {}
+                    for fib, js in cells.items():
+                        g, j = max((gain(j, t_sat), j) for j in js)
+                        if g > 0:
+                            total += g
+                            pick[fib] = j
+                    if not pick:
+                        break
+                    if len(pick) < len(pick0) or total < total0 * SAT_MIN_GAIN:
+                        break                           # 拉长反而掉目标 / 增益不划算: 保持原样
+                    T0, pick0, total0 = t_sat, pick, total
+                    net = (total - lam * t_sat) * (1.0 + 0.25 * self._direction_preference(c_alt, c_az))
+                    found = (net, t_sat, pick, total)
             return found
 
         best_near = None
