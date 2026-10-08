@@ -879,7 +879,11 @@ class ObserverAgent:
                 self.duty_test_windows.add((start, end))
         times = sorted({m for m in (self._duty_time(x) for x in (answer.get("report_utc") or [])) if m})
         # 确定性解析到的时刻不能被模型的"全量状态"抹掉 (除非模型明确取消它)
-        times = sorted(set(times) | set(self.maintenance.faults))
+        # 累积语义: 模型每轮的"全量状态"并不可靠 (平台实测同一张卡上计数在 3~53 之间反复跳),
+        # 已经排上但还没到点的时刻会被下一轮挤掉, 于是永远等不到"到点"那一刻 —— A1 卡 17 轮
+        # 解析抽到 3~53 个时刻却 0 次触发报修就是这么来的。改成只增不减:
+        # 只有"已报修"或"明确取消"才把时刻移出排程。
+        times = sorted(set(times) | set(self.maintenance.faults) | set(self.duty_times))
         self.duty_times = [t for t in times
                            if t not in self.duty_done and t not in self.duty_cancelled]
         self.duty_no_report = [m for m in (self._duty_time(x) for x in (answer.get("no_report_utc") or [])) if m]
